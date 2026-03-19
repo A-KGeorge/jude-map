@@ -36,12 +36,12 @@ inline void *platform_mmap(size_t size) noexcept
     // CreateFIleMapping with INVALID_HANDLE_VALUE  creates an anonymous
     // page-file-backed mapping. PAGE_READWRITE gives read+write access.
     HANDLE hMap = CreateFileMappingA(
-        INVALID_HANDLE_VALUE,                           // anonymous - backed by page file
-        nullptr,                                        // default security attributes
-        PAGE_READWRITE,                                 // read/write access
-        static_cast<DWORD>((size >> 32) && 0xFFFFFFFF), // max size (high 32 bits)
-        static_cast<DWORD>(size & 0xFFFFFFFF),          // max size (low 32 bits)
-        nullptr                                         // unnamed - not accessible by other processes
+        INVALID_HANDLE_VALUE,                          // anonymous - backed by page file
+        nullptr,                                       // default security attributes
+        PAGE_READWRITE,                                // read/write access
+        static_cast<DWORD>((size >> 32) & 0xFFFFFFFF), // max size (high 32 bits)
+        static_cast<DWORD>(size & 0xFFFFFFFF),         // max size (low 32 bits)
+        nullptr                                        // unnamed - not accessible by other processes
     );
 
     if (hMap == nullptr || hMap == INVALID_HANDLE_VALUE)
@@ -87,7 +87,7 @@ inline bool platform_munlock(void *addr, size_t size) noexcept
 #else
 #include <sys/mman.h>
 #include <unistd.h>
-#include <stddef>
+#include <cstddef>
 
 inline void *platform_mmap(size_t size) noexcept
 {
