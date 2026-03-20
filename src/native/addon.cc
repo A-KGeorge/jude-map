@@ -7,6 +7,36 @@
 #include <memory>
 #include <mutex>
 
+// SIMD feature detection
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define SIMD_X86
+#if defined(__AVX2__)
+#define SIMD_AVX2
+#define SIMD_AVX
+#define SIMD_SSE3
+#include <immintrin.h>
+#elif defined(__AVX__)
+#define SIMD_AVX
+#define SIMD_SSE3
+#include <immintrin.h>
+#elif defined(__SSE3__)
+#define SIMD_SSE3
+#include <pmmintrin.h>
+#include <emmintrin.h>
+#include <xmmintrin.h>
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define SIMD_SSE2
+#include <emmintrin.h>
+#include <xmmintrin.h>
+#elif defined(__SSE__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
+#define SIMD_SSE
+#include <xmmintrin.h>
+#endif
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#define SIMD_NEON
+#include <arm_neon.h>
+#endif
+
 #include "platform_mmap.h"
 #include "segment.h"
 
@@ -535,6 +565,202 @@ private:
             ptr[i] = val;
     }
 
+    static void fill_u8(void *dest, size_t n_elems, uint8_t value) noexcept
+    {
+        std::memset(dest, static_cast<int>(value), n_elems);
+    }
+
+    static void fill_i8(void *dest, size_t n_elems, int8_t value) noexcept
+    {
+        std::memset(dest, static_cast<unsigned char>(value), n_elems);
+    }
+
+    static void fill_u16(void *dest, size_t n_elems, uint16_t value) noexcept
+    {
+#if defined(SIMD_AVX2)
+        auto *ptr = reinterpret_cast<uint16_t *>(dest);
+        size_t i = 0;
+        const __m256i v = _mm256_set1_epi16(static_cast<short>(value));
+        for (; i + 16 <= n_elems; i += 16)
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_SSE2)
+        auto *ptr = reinterpret_cast<uint16_t *>(dest);
+        size_t i = 0;
+        const __m128i v = _mm_set1_epi16(static_cast<short>(value));
+        for (; i + 8 <= n_elems; i += 8)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_NEON)
+        auto *ptr = reinterpret_cast<uint16_t *>(dest);
+        size_t i = 0;
+        const uint16x8_t v = vdupq_n_u16(value);
+        for (; i + 8 <= n_elems; i += 8)
+            vst1q_u16(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#else
+        typed_fill<uint16_t>(dest, n_elems, static_cast<double>(value));
+#endif
+    }
+
+    static void fill_i16(void *dest, size_t n_elems, int16_t value) noexcept
+    {
+#if defined(SIMD_AVX2)
+        auto *ptr = reinterpret_cast<int16_t *>(dest);
+        size_t i = 0;
+        const __m256i v = _mm256_set1_epi16(value);
+        for (; i + 16 <= n_elems; i += 16)
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_SSE2)
+        auto *ptr = reinterpret_cast<int16_t *>(dest);
+        size_t i = 0;
+        const __m128i v = _mm_set1_epi16(value);
+        for (; i + 8 <= n_elems; i += 8)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_NEON)
+        auto *ptr = reinterpret_cast<int16_t *>(dest);
+        size_t i = 0;
+        const int16x8_t v = vdupq_n_s16(value);
+        for (; i + 8 <= n_elems; i += 8)
+            vst1q_s16(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#else
+        typed_fill<int16_t>(dest, n_elems, static_cast<double>(value));
+#endif
+    }
+
+    static void fill_f32(void *dest, size_t n_elems, float value) noexcept
+    {
+#if defined(SIMD_AVX)
+        auto *ptr = reinterpret_cast<float *>(dest);
+        size_t i = 0;
+        const __m256 v = _mm256_set1_ps(value);
+        for (; i + 8 <= n_elems; i += 8)
+            _mm256_storeu_ps(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_SSE2)
+        auto *ptr = reinterpret_cast<float *>(dest);
+        size_t i = 0;
+        const __m128 v = _mm_set1_ps(value);
+        for (; i + 4 <= n_elems; i += 4)
+            _mm_storeu_ps(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_NEON)
+        auto *ptr = reinterpret_cast<float *>(dest);
+        size_t i = 0;
+        const float32x4_t v = vdupq_n_f32(value);
+        for (; i + 4 <= n_elems; i += 4)
+            vst1q_f32(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#else
+        typed_fill<float>(dest, n_elems, static_cast<double>(value));
+#endif
+    }
+
+    static void fill_f64(void *dest, size_t n_elems, double value) noexcept
+    {
+#if defined(SIMD_AVX)
+        auto *ptr = reinterpret_cast<double *>(dest);
+        size_t i = 0;
+        const __m256d v = _mm256_set1_pd(value);
+        for (; i + 4 <= n_elems; i += 4)
+            _mm256_storeu_pd(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_SSE2)
+        auto *ptr = reinterpret_cast<double *>(dest);
+        size_t i = 0;
+        const __m128d v = _mm_set1_pd(value);
+        for (; i + 2 <= n_elems; i += 2)
+            _mm_storeu_pd(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_NEON) && defined(__aarch64__)
+        auto *ptr = reinterpret_cast<double *>(dest);
+        size_t i = 0;
+        const float64x2_t v = vdupq_n_f64(value);
+        for (; i + 2 <= n_elems; i += 2)
+            vst1q_f64(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#else
+        typed_fill<double>(dest, n_elems, value);
+#endif
+    }
+
+    static void fill_i32(void *dest, size_t n_elems, int32_t value) noexcept
+    {
+#if defined(SIMD_AVX2)
+        auto *ptr = reinterpret_cast<int32_t *>(dest);
+        size_t i = 0;
+        const __m256i v = _mm256_set1_epi32(value);
+        for (; i + 8 <= n_elems; i += 8)
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_SSE2)
+        auto *ptr = reinterpret_cast<int32_t *>(dest);
+        size_t i = 0;
+        const __m128i v = _mm_set1_epi32(value);
+        for (; i + 4 <= n_elems; i += 4)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_NEON)
+        auto *ptr = reinterpret_cast<int32_t *>(dest);
+        size_t i = 0;
+        const int32x4_t v = vdupq_n_s32(value);
+        for (; i + 4 <= n_elems; i += 4)
+            vst1q_s32(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#else
+        typed_fill<int32_t>(dest, n_elems, static_cast<double>(value));
+#endif
+    }
+
+    static void fill_i64(void *dest, size_t n_elems, int64_t value) noexcept
+    {
+#if defined(SIMD_AVX2)
+        auto *ptr = reinterpret_cast<int64_t *>(dest);
+        size_t i = 0;
+        const __m256i v = _mm256_set1_epi64x(value);
+        for (; i + 4 <= n_elems; i += 4)
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_SSE2)
+        auto *ptr = reinterpret_cast<int64_t *>(dest);
+        size_t i = 0;
+        const __m128i v = _mm_set_epi64x(value, value);
+        for (; i + 2 <= n_elems; i += 2)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(ptr + i), v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#elif defined(SIMD_NEON)
+        auto *ptr = reinterpret_cast<int64_t *>(dest);
+        size_t i = 0;
+        const int64x2_t v = vdupq_n_s64(value);
+        for (; i + 2 <= n_elems; i += 2)
+            vst1q_s64(ptr + i, v);
+        for (; i < n_elems; ++i)
+            ptr[i] = value;
+#else
+        typed_fill<int64_t>(dest, n_elems, static_cast<double>(value));
+#endif
+    }
+
     // -----------------------------------------------------------------------
     // fill(shape: number[], dtype: DType, value: number) → void
     //
@@ -633,31 +859,31 @@ private:
         switch (dtype)
         {
         case DType::FLOAT32:
-            typed_fill<float>(dest, n_elems, fill_value);
+            fill_f32(dest, n_elems, static_cast<float>(fill_value));
             break;
         case DType::FLOAT64:
-            typed_fill<double>(dest, n_elems, fill_value);
+            fill_f64(dest, n_elems, fill_value);
             break;
         case DType::INT32:
-            typed_fill<int32_t>(dest, n_elems, fill_value);
+            fill_i32(dest, n_elems, static_cast<int32_t>(fill_value));
             break;
         case DType::INT64:
-            typed_fill<int64_t>(dest, n_elems, fill_value);
+            fill_i64(dest, n_elems, static_cast<int64_t>(fill_value));
             break;
         case DType::UINT8:
-            typed_fill<uint8_t>(dest, n_elems, fill_value);
+            fill_u8(dest, n_elems, static_cast<uint8_t>(fill_value));
             break;
         case DType::INT8:
-            typed_fill<int8_t>(dest, n_elems, fill_value);
+            fill_i8(dest, n_elems, static_cast<int8_t>(fill_value));
             break;
         case DType::UINT16:
-            typed_fill<uint16_t>(dest, n_elems, fill_value);
+            fill_u16(dest, n_elems, static_cast<uint16_t>(fill_value));
             break;
         case DType::INT16:
-            typed_fill<int16_t>(dest, n_elems, fill_value);
+            fill_i16(dest, n_elems, static_cast<int16_t>(fill_value));
             break;
         case DType::BOOL:
-            typed_fill<uint8_t>(dest, n_elems, fill_value != 0.0 ? 1.0 : 0.0);
+            fill_u8(dest, n_elems, fill_value != 0.0 ? 1 : 0);
             break;
         default:
             break;

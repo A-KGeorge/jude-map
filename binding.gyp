@@ -47,7 +47,7 @@
       "conditions": [
         # Condition for Windows
         ["OS=='win'", {
-          "defines": [ "_HAS_EXCEPTIONS=1" ]
+          "defines": [ "_HAS_EXCEPTIONS=1", "__AVX2__=1", "__AVX__=1", "__SSE3__=1" ]
         }],
         # Condition for x64 architecture (Linux/macOS)
         ['target_arch=="x64"', {
