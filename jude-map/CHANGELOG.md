@@ -1,5 +1,11 @@
 # jude-map
 
+## 0.1.0
+
+### Minor Changes
+
+- [`ca02abb`](https://github.com/A-KGeorge/jude-map/commit/ca02abb626deb093a4bd9f83131e3e9ff28274f3) Thanks [@A-KGeorge](https://github.com/A-KGeorge)! - chore: release 0.1.0
+
 ## 0.0.2
 
 ### Patch Changes
