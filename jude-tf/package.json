@@ -1,0 +1,50 @@
+{
+  "name": "jude-tf",
+  "version": "0.0.0-alpha",
+  "description": "TensorFlow C API bindings for Node.js — zero-copy inference via jude-map",
+  "main":  "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type":  "module",
+  "files": [
+    "dist",
+    "prebuilds",
+    "src/native",
+    "binding.gyp",
+    "package.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build:ts":     "tsc",
+    "build:native": "node-gyp rebuild",
+    "build":        "npm run build:ts && npm run build:native",
+    "test":         "node --import tsx --test src/ts/__tests__/*.test.ts"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "tensorflow",
+    "inference",
+    "native addon",
+    "zero-copy",
+    "mmap",
+    "jude-map"
+  ],
+  "author": "Alan Kochukalam George",
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "jude-map": ">=0.0.0-alpha"
+  },
+  "dependencies": {
+    "node-addon-api":  "^8.6.0",
+    "node-gyp-build":  "^4.8.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "tsx":         "^4.0.0",
+    "typescript":  "^5.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
