@@ -1,0 +1,79 @@
+{
+  "name": "jude-map",
+  "version": "0.0.2",
+  "description": "",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "prebuilds",
+    "src/native",
+    "binding.gyp",
+    "package.json",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "install": "node scripts/install.js",
+    "test": "node scripts/test.js",
+    "test:clean": "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
+    "test:install": "node scripts/test-install.js",
+    "build:ts": "tsc",
+    "build:native": "node-gyp rebuild",
+    "build": "npm run build:ts && npm run build:native",
+    "prebuildify": "prebuildify --napi --strip --target 18.0.0 --target 20.0.0 --target 22.0.0 --target 24.0.0",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "publish-packages": "changeset publish"
+  },
+  "binary": {
+    "napi_versions": [
+      8
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/A-KGeorge/jude-map.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
+  "keywords": [
+    "shared mmap",
+    "memory-mapped files",
+    "concurrent access",
+    "cross-platform",
+    "Node.js",
+    "C++",
+    "native addon",
+    "high performance",
+    "low latency",
+    "data sharing",
+    "inter-process communication"
+  ],
+  "author": "Alan Kochukalam George",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=11.5.1"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.6.0",
+    "node-gyp-build": "^4.8.4"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.30.0",
+    "@jest/globals": "^30.3.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.5.0",
+    "jest": "^30.3.0",
+    "prebuildify": "^6.0.1",
+    "ts-jest": "^29.4.6",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

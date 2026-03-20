@@ -3,98 +3,176 @@ name: Prebuilds
 on:
   push:
     tags:
+      - "jude-map@*"
+      - "jude-tf@*"
       - "v*"
   workflow_dispatch:
+    inputs:
+      package:
+        description: "Which package to build prebuilds for"
+        required: true
+        type: choice
+        options: [jude-map, jude-tf, both]
+
+env:
+  TF_VERSION: "2.18.1"
 
 jobs:
-  build-prebuilds:
-    name: Build on ${{ matrix.os }}
+  # ---------------------------------------------------------------------------
+  # jude-map prebuilds
+  # ---------------------------------------------------------------------------
+  prebuild-jude-map:
+    name: "jude-map / ${{ matrix.os }} (${{ matrix.arch }})"
+    if: |
+      startsWith(github.ref, 'refs/tags/jude-map@') ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event.inputs.package == 'jude-map' ||
+      github.event.inputs.package == 'both'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jude-map
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macOS Intel (x64)
-          - os: macos-13
+          - os: ubuntu-22.04
             arch: x64
-
-          # macOS Apple Silicon (arm64)
-          - os: macos-14
-            arch: arm64
-
-          # Linux x64
-          - os: ubuntu-latest
-            arch: x64
-
-          # Windows x64
           - os: windows-latest
             arch: x64
-
-    runs-on: ${{ matrix.os }}
-
+          - os: macos-13
+            arch: x64
+          - os: macos-latest
+            arch: arm64
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - name: Build TypeScript
-        run: npm run build:ts
+      - run: npm ci
 
-      - name: Generate prebuilds
-        run: npm run prebuildify
+      - run: npm run build:ts
 
-      - name: Upload prebuilds
-        uses: actions/upload-artifact@v4
+      - run: npm run prebuildify
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: prebuilds-${{ matrix.os }}-${{ matrix.arch }}
-          path: prebuilds/
+          name: jude-map-prebuilds-${{ matrix.os }}-${{ matrix.arch }}
+          path: jude-map/prebuilds/
           retention-days: 30
 
-      - name: Display prebuild info
-        shell: bash
-        run: |
-          echo "📦 Prebuilds generated:"
-          ls -lR prebuilds/ || dir /s prebuilds\
-
-  collect-prebuilds:
-    name: Collect and commit prebuilds
-    needs: build-prebuilds
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-
+  # ---------------------------------------------------------------------------
+  # jude-tf prebuilds
+  # ---------------------------------------------------------------------------
+  prebuild-jude-tf:
+    name: "jude-tf / ${{ matrix.os }} (${{ matrix.arch }})"
+    if: |
+      startsWith(github.ref, 'refs/tags/jude-tf@') ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event.inputs.package == 'jude-tf' ||
+      github.event.inputs.package == 'both'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jude-tf
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: x64
+          - os: windows-latest
+            arch: x64
+          - os: macos-13
+            arch: x64
+          - os: macos-latest
+            arch: arm64
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download all prebuilds
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
+      - name: Install libtensorflow (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
+          sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          sudo ldconfig
+          echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+
+      - name: Install libtensorflow (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-${{ matrix.arch }}.tar.gz"
+          sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-${{ matrix.arch }}.tar.gz
+          echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+
+      - name: Install libtensorflow (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile libtf.zip
+          Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
+          echo "LIBTENSORFLOW_PATH=C:\libtensorflow" >> $env:GITHUB_ENV
+          echo "C:\libtensorflow\lib" >> $env:GITHUB_PATH
+
+      - run: npm ci
+
+      - run: npm run build:ts
+
+      - run: npm run prebuildify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jude-tf-prebuilds-${{ matrix.os }}-${{ matrix.arch }}
+          path: jude-tf/prebuilds/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Collect all prebuilds and create a GitHub release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [prebuild-jude-map, prebuild-jude-tf]
+    if: |
+      always() &&
+      (needs.prebuild-jude-map.result == 'success' || needs.prebuild-jude-map.result == 'skipped') &&
+      (needs.prebuild-jude-tf.result == 'success'  || needs.prebuild-jude-tf.result == 'skipped') &&
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
-      - name: Organize prebuilds
+      - name: Organise prebuilds
         run: |
-          mkdir -p prebuilds
-          find artifacts -type f -name "*.node" -exec cp {} prebuilds/ \;
-          ls -lR prebuilds/
+          mkdir -p jude-map/prebuilds jude-tf/prebuilds
+          find artifacts -path '*/jude-map-prebuilds-*/*.node' -exec cp {} jude-map/prebuilds/ \;
+          find artifacts -path '*/jude-tf-prebuilds-*/*.node'  -exec cp {} jude-tf/prebuilds/ \;
+          echo "── jude-map ──" && ls jude-map/prebuilds/
+          echo "── jude-tf ──"  && ls jude-tf/prebuilds/
 
-      - name: Create release
-        uses: softprops/action-gh-release@v1
+      - uses: softprops/action-gh-release@v1
         with:
-          files: prebuilds/**/*.node
+          files: |
+            jude-map/prebuilds/**/*.node
+            jude-tf/prebuilds/**/*.node
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Commit prebuilds
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add prebuilds/
-          git commit -m "chore: update prebuilds for ${{ github.ref_name }}" || echo "No changes to commit"
-          git push origin HEAD:main || echo "No changes to push"

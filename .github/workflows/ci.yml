@@ -10,219 +10,343 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  NODE_DEFAULT: "22.x"
+  TF_VERSION: "2.18.1"
+
 jobs:
-  # 🧪 Ubuntu tests
-  test-ubuntu:
-    name: Test on Ubuntu - Node ${{ matrix.node-version }}
+  # ---------------------------------------------------------------------------
+  # 0. Detect which packages changed
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changed packages
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: [18.x, 20.x, 22.x]
-
+    outputs:
+      jude-map: ${{ steps.filter.outputs.jude-map }}
+      jude-tf: ${{ steps.filter.outputs.jude-tf }}
+      ci: ${{ steps.filter.outputs.ci }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: "npm"
+          filters: |
+            jude-map:
+              - 'jude-map/**'
+            jude-tf:
+              - 'jude-tf/**'
+            ci:
+              - '.github/workflows/**'
 
-      # Cache npm packages
-      - name: Cache npm cache directory
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-${{ matrix.node-version }}-
-
-      # Cache native build outputs
-      - name: Cache native build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/Release
-          key: ${{ runner.os }}-${{ matrix.node-version }}-${{ hashFiles('binding.gyp', 'src/native/**/*.cc', 'src/native/**/*.h', 'package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.node-version }}-
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential python3
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build native addon
-        run: npm run build
-
-      - name: Copy native addon to src/build
-        run: |
-          mkdir -p src/build
-          cp build/Release/jude-map.node src/build/
-
-      - name: Run all tests
-        run: npm test
-
-  # 🧪 macOS + Windows tests
-  test-other:
-    name: Test on ${{ matrix.os }} - Node ${{ matrix.node-version }}
+  # ---------------------------------------------------------------------------
+  # 1. jude-map tests
+  # ---------------------------------------------------------------------------
+  test-jude-map:
+    name: "jude-map / ${{ matrix.os }} / Node ${{ matrix.node }}"
+    needs: changes
+    if: |
+      needs.changes.outputs.jude-map == 'true' ||
+      needs.changes.outputs.ci == 'true' ||
+      github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jude-map
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
-        node-version: [18.x, 20.x, 22.x]
-
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ["18.x", "20.x", "22.x"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: "npm"
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: jude-map/package-lock.json
 
-      # Cache npm
-      - name: Cache npm cache directory
+      - name: Cache native build
         uses: actions/cache@v4
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-${{ matrix.node-version }}-
-
-      # Cache build artifacts
-      - name: Cache native build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/Release
-          key: ${{ runner.os }}-${{ matrix.node-version }}-${{ hashFiles('binding.gyp', 'src/native/**/*.cc', 'src/native/**/*.h', 'package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.node-version }}-
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build native addon
-        run: npm run build
-
-      - name: Copy native addon to src/build
-        shell: bash
-        run: |
-          mkdir -p src/build
-          cp build/Release/jude-map.node src/build/
-
-      - name: Run tests
-        run: npm test
-
-  # 🏗️ Prebuilds for all OS
-  prebuild:
-    name: Prebuild ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    needs: [test-ubuntu, test-other]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: "npm"
-
-      - name: Cache npm cache directory
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-22-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-22-
+          path: jude-map/build/Release
+          key: jude-map-${{ runner.os }}-${{ matrix.node }}-${{ hashFiles('jude-map/binding.gyp', 'jude-map/src/native/**') }}
+          restore-keys: jude-map-${{ runner.os }}-${{ matrix.node }}-
 
       - name: Install build tools (Linux)
-        if: ${{ matrix.os == 'ubuntu-22.04' }}
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential python3
 
-      - name: Install dependencies
-        run: npm install
+      - run: npm ci
 
-      - name: Build prebuild binaries
-        run: npm run prebuildify
+      - run: npm run build
 
-      - name: Upload prebuilds
-        uses: actions/upload-artifact@v4
+      - name: Copy addon to src/build
+        shell: bash
+        run: mkdir -p src/build && cp build/Release/jude-map.node src/build/
+
+      - run: npm test
+
+  # ---------------------------------------------------------------------------
+  # 2. jude-map prebuilds (main branch only)
+  # ---------------------------------------------------------------------------
+  prebuild-jude-map:
+    name: "jude-map prebuild / ${{ matrix.os }}"
+    needs: test-jude-map
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jude-map
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-13, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
-          name: prebuilds-${{ matrix.os }}
-          path: prebuilds/
+          node-version: ${{ env.NODE_DEFAULT }}
+          cache: npm
+          cache-dependency-path: jude-map/package-lock.json
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
+      - run: npm ci
+
+      - run: npm run prebuildify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jude-map-prebuilds-${{ matrix.os }}
+          path: jude-map/prebuilds/
           retention-days: 90
 
-  # 🚀 Release job
+  # ---------------------------------------------------------------------------
+  # 3. Install libtensorflow (runs in parallel with jude-map tests)
+  # ---------------------------------------------------------------------------
+  install-libtensorflow:
+    name: "libtensorflow / ${{ matrix.os }}"
+    needs: changes
+    if: |
+      needs.changes.outputs.jude-tf == 'true' ||
+      needs.changes.outputs.ci == 'true' ||
+      github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Cache libtensorflow
+        id: cache-tf
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/tensorflow
+            /usr/local/lib/libtensorflow*
+            C:\libtensorflow
+          key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux' && steps.cache-tf.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-linux-x86_64.tar.gz"
+          sudo tar -C /usr/local -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          sudo ldconfig
+
+      - name: Install (macOS)
+        if: runner.os == 'macOS' && steps.cache-tf.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-x86_64.tar.gz" \
+            || wget -q "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-darwin-arm64.tar.gz"
+          sudo tar -C /usr/local -xzf libtensorflow-cpu-darwin-*.tar.gz
+
+      - name: Install (Windows)
+        if: runner.os == 'Windows' && steps.cache-tf.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://storage.googleapis.com/tensorflow/versions/${{ env.TF_VERSION }}/libtensorflow-cpu-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile libtf.zip
+          Expand-Archive libtf.zip -DestinationPath C:\libtensorflow
+
+  # ---------------------------------------------------------------------------
+  # 4. jude-tf tests
+  # ---------------------------------------------------------------------------
+  test-jude-tf:
+    name: "jude-tf / ${{ matrix.os }} / Node ${{ matrix.node }}"
+    needs: [changes, test-jude-map, install-libtensorflow]
+    if: |
+      needs.changes.outputs.jude-tf == 'true' ||
+      needs.changes.outputs.ci == 'true' ||
+      github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jude-tf
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ["18.x", "20.x", "22.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: jude-tf/package-lock.json
+
+      - name: Restore libtensorflow
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/tensorflow
+            /usr/local/lib/libtensorflow*
+            C:\libtensorflow
+          key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
+
+      - name: Set LIBTENSORFLOW_PATH (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+
+      - name: Set LIBTENSORFLOW_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "LIBTENSORFLOW_PATH=C:\libtensorflow" >> $env:GITHUB_ENV
+          echo "C:\libtensorflow\lib" >> $env:GITHUB_PATH
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
+      - name: Install jude-map (peer dep)
+        run: cd ../jude-map && npm ci && npm run build
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm test
+
+  # ---------------------------------------------------------------------------
+  # 5. jude-tf prebuilds (main branch only)
+  # ---------------------------------------------------------------------------
+  prebuild-jude-tf:
+    name: "jude-tf prebuild / ${{ matrix.os }}"
+    needs: test-jude-tf
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jude-tf
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-13, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_DEFAULT }}
+          cache: npm
+          cache-dependency-path: jude-tf/package-lock.json
+
+      - name: Restore libtensorflow
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/tensorflow
+            /usr/local/lib/libtensorflow*
+            C:\libtensorflow
+          key: libtensorflow-${{ env.TF_VERSION }}-${{ runner.os }}
+
+      - name: Set LIBTENSORFLOW_PATH (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: echo "LIBTENSORFLOW_PATH=/usr/local" >> $GITHUB_ENV
+
+      - name: Set LIBTENSORFLOW_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "LIBTENSORFLOW_PATH=C:\libtensorflow" >> $env:GITHUB_ENV
+          echo "C:\libtensorflow\lib" >> $env:GITHUB_PATH
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3
+
+      - run: npm ci
+
+      - run: npm run prebuildify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jude-tf-prebuilds-${{ matrix.os }}
+          path: jude-tf/prebuilds/
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # 6. Release via changesets (main only, after all prebuilds)
+  # ---------------------------------------------------------------------------
   release:
     name: Release and Publish
     runs-on: ubuntu-latest
-    needs: [test-ubuntu, test-other, prebuild]
+    needs: [prebuild-jude-map, prebuild-jude-tf]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
-      contents: write # To create release tags and GitHub releases
-      pull-requests: write # To create the versioning PR (if you use it)
-      id-token: write # Required for npm OIDC trusted publishing
+      contents: write
+      pull-requests: write
+      id-token: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Required by changesets
+          fetch-depth: 0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 24.x
-          cache: "npm"
+          node-version: ${{ env.NODE_DEFAULT }}
           registry-url: "https://registry.npmjs.org"
 
-      - name: Update npm to latest
-        run: npm install -g npm@latest
+      - run: npm install -g npm@latest
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
-      - name: Build TypeScript
-        run: npm run build:ts
+      - run: npm run build:ts
+        working-directory: jude-map
 
-      # Download all prebuilds from the prebuild job
-      - name: Download prebuilds (Linux)
+      - run: npm run build:ts
+        working-directory: jude-tf
+
+      - name: Download jude-map prebuilds
         uses: actions/download-artifact@v4
         with:
-          name: prebuilds-ubuntu-22.04
-          path: prebuilds/
+          pattern: jude-map-prebuilds-*
+          path: jude-map/prebuilds/
+          merge-multiple: true
 
-      - name: Download prebuilds (macOS)
+      - name: Download jude-tf prebuilds
         uses: actions/download-artifact@v4
         with:
-          name: prebuilds-macos-latest
-          path: prebuilds/
-
-      - name: Download prebuilds (Windows)
-        uses: actions/download-artifact@v4
-        with:
-          name: prebuilds-windows-latest
-          path: prebuilds/
+          pattern: jude-tf-prebuilds-*
+          path: jude-tf/prebuilds/
+          merge-multiple: true
 
       - name: Verify prebuilds
         run: |
-          echo "📦 Prebuilds included in npm package:"
-          ls -lR prebuilds/ || echo "⚠️ No prebuilds found"
+          echo "── jude-map ──" && ls jude-map/prebuilds/
+          echo "── jude-tf ──"  && ls jude-tf/prebuilds/
 
-      - name: Build package
-        run: npm run build
-
-      - name: Version and Publish
-        id: changesets
-        uses: changesets/action@v1
+      - uses: changesets/action@v1
         with:
-          # This runs "npm run version" to create the PR
           version: npm run version
-          # This runs "npm run publish-packages" AFTER the PR is merged
           publish: npm run publish-packages
           commit: "ci(release): version packages"
           title: "ci(release): version packages"
@@ -230,18 +354,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
 
-  # 🧹 Lint and Type Check
+  # ---------------------------------------------------------------------------
+  # 7. Lint and type-check (always runs)
+  # ---------------------------------------------------------------------------
   lint:
-    name: Lint and Type Check
+    name: Lint and type-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.x
-          cache: "npm"
-      - run: npm install
-      - run: npx eslint src --max-warnings=0 || echo "⚠️ ESLint not configured, skipping"
+          node-version: ${{ env.NODE_DEFAULT }}
+
+      - name: Type-check jude-map
+        working-directory: jude-map
+        run: npm ci && npx tsc --noEmit
         continue-on-error: true
-      - run: npx tsc --noEmit || echo "⚠️ TypeScript check skipped"
+
+      - name: Type-check jude-tf
+        working-directory: jude-tf
+        run: npm ci && npx tsc --noEmit
         continue-on-error: true
