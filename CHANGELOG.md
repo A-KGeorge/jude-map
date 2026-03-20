@@ -1,5 +1,11 @@
 # jude-map
 
+## 0.0.2
+
+### Patch Changes
+
+- [`6a93154`](https://github.com/A-KGeorge/jude-map/commit/6a931543b9479c32fc3e0be405891628bb25611f) Thanks [@A-KGeorge](https://github.com/A-KGeorge)! - Added SIMD
+
 ## 0.0.1
 
 ### Patch Changes
