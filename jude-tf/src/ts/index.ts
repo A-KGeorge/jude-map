@@ -2,7 +2,10 @@
 
 import nodeGypBuild from "node-gyp-build";
 import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -68,6 +71,13 @@ export interface TensorResult {
     | ArrayBuffer;
 }
 
+export interface FreezeSavedModelOptions {
+  pythonBin?: string;
+  signatureKey?: string;
+  outputPath?: string;
+  keepFrozenGraph?: boolean;
+}
+
 // Accepted input types for run()
 type TensorInput =
   | Float32Array
@@ -113,6 +123,116 @@ export class TFSession {
       ? NativeTFSession.loadSavedModel(dir, tags)
       : NativeTFSession.loadSavedModel(dir));
     return new TFSession(native);
+  }
+
+  /**
+   * Load a SavedModel by first freezing variables into a GraphDef, then loading
+   * the resulting frozen graph via the stable C API path.
+   *
+   * This is the recommended workaround when direct SavedModel execution via the
+   * TensorFlow C API fails to restore ResourceVariable checkpoints correctly.
+   */
+  static async loadSavedModelAsFrozen(
+    dir: string,
+    options?: FreezeSavedModelOptions,
+  ): Promise<TFSession> {
+    const pythonBin = options?.pythonBin || process.env.PYTHON || "python";
+    const signatureKey = options?.signatureKey || "serving_default";
+    const absoluteDir = resolve(dir); // Convert relative path to absolute
+
+    let tempDir: string | null = null;
+    let frozenPath = options?.outputPath;
+
+    if (!frozenPath) {
+      tempDir = await mkdtemp(join(tmpdir(), "jude-tf-freeze-"));
+      frozenPath = join(tempDir, "model_frozen.pb");
+    }
+
+    const script = [
+      "import argparse",
+      "import os",
+      "import tensorflow as tf",
+      "from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2",
+      "",
+      "parser = argparse.ArgumentParser()",
+      "parser.add_argument('--saved-model-dir', required=True)",
+      "parser.add_argument('--out', required=True)",
+      "parser.add_argument('--signature-key', default='serving_default')",
+      "args = parser.parse_args()",
+      "",
+      "loaded = tf.saved_model.load(args.saved_model_dir)",
+      "if args.signature_key not in loaded.signatures:",
+      "    keys = ', '.join(sorted(loaded.signatures.keys()))",
+      "    raise ValueError(f'Signature key {args.signature_key!r} not found. Available: {keys}')",
+      "",
+      "concrete = loaded.signatures[args.signature_key]",
+      "frozen = convert_variables_to_constants_v2(concrete)",
+      "out_dir = os.path.dirname(os.path.abspath(args.out)) or '.'",
+      "out_name = os.path.basename(args.out)",
+      "os.makedirs(out_dir, exist_ok=True)",
+      "tf.io.write_graph(frozen.graph, out_dir, out_name, as_text=False)",
+    ].join("\n");
+
+    await new Promise<void>((resolve, reject) => {
+      const args = [
+        "-c",
+        script,
+        "--saved-model-dir",
+        absoluteDir,
+        "--out",
+        frozenPath!,
+        "--signature-key",
+        signatureKey,
+      ];
+
+      const child = spawn(pythonBin, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      let stderr = "";
+      let stdout = "";
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", (err) => {
+        reject(
+          new Error(
+            `Failed to start Python process (${pythonBin}): ${err.message}`,
+          ),
+        );
+      });
+      child.on("exit", (code) => {
+        if (code === 0) {
+          resolve();
+          return;
+        }
+        reject(
+          new Error(
+            [
+              "Failed to freeze SavedModel to GraphDef.",
+              `python: ${pythonBin}`,
+              `exit code: ${code}`,
+              stdout ? `stdout:\n${stdout.trim()}` : "",
+              stderr ? `stderr:\n${stderr.trim()}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          ),
+        );
+      });
+    });
+
+    try {
+      return await TFSession.loadFrozenGraph(frozenPath);
+    } finally {
+      if (tempDir && !options?.keepFrozenGraph) {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    }
   }
 
   /**

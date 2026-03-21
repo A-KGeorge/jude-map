@@ -24,6 +24,7 @@ describe("TFSession API", () => {
     if (!TFSession) return;
     assert.equal(typeof TFSession.loadSavedModel, "function");
     assert.equal(typeof TFSession.loadFrozenGraph, "function");
+    assert.equal(typeof TFSession.loadSavedModelAsFrozen, "function");
   });
 
   it("loadFrozenGraph rejects for missing file", async (t) => {

@@ -107,6 +107,21 @@ seg.destroy();
 sess.destroy();
 ```
 
+### SavedModel (freeze workaround for C API variable restore issues)
+
+```ts
+import { TFSession } from "jude-tf";
+
+// Converts SavedModel -> frozen GraphDef via Python/TensorFlow,
+// then loads the frozen graph for inference.
+const sess = await TFSession.loadSavedModelAsFrozen("./test_model");
+
+const out = await sess.run({ inputs: new Float32Array([1, 2, 3, 4]) });
+console.log(Object.keys(out));
+
+sess.destroy();
+```
+
 ### Frozen graph
 
 ```ts
@@ -170,6 +185,18 @@ Returns `Promise<TFSession>`.
 ### `TFSession.loadFrozenGraph(path)`
 
 Loads a frozen `GraphDef` from a `.pb` file. Inputs are inferred from `Placeholder` ops in the graph. Use op names directly as input keys in `run()`.
+
+Returns `Promise<TFSession>`.
+
+### `TFSession.loadSavedModelAsFrozen(dir, options?)`
+
+Loads a SavedModel by first freezing variables into a GraphDef and then using the frozen-graph runtime path.
+
+- `dir` — path to SavedModel directory
+- `options.pythonBin` — Python executable (default: `PYTHON` env var or `python`)
+- `options.signatureKey` — signature to freeze (default: `serving_default`)
+- `options.outputPath` — optional output `.pb` path; temp file is used if omitted
+- `options.keepFrozenGraph` — keep temp frozen graph when outputPath is omitted
 
 Returns `Promise<TFSession>`.
 
@@ -255,6 +282,7 @@ On Windows set `LIBTENSORFLOW_PATH` as a user environment variable rather than i
 - [x] CPU inference
 - [x] `runAsync()` — `TF_SessionRun` on libuv thread pool (event loop free during inference)
 - [ ] SavedModel variable restoration (ResourceVariable checkpoint loading via C API)
+      : Use `loadSavedModelAsFrozen()` as a production workaround.
 - [ ] GPU inference path (CUDA session options, `TF_GPU_THREAD_MODE`)
 - [ ] TFLite (separate target, different C API)
 
