@@ -1,5 +1,5 @@
 ---
-"jude-map": patch
+"jude-map": minor
 ---
 
-Updated directory
+Test version bump for CI validation and improvements

@@ -1,10 +1,9 @@
 {
   "name": "jude-tf",
-  "version": "0.0.0-alpha",
+  "version": "0.0.1",
   "description": "TensorFlow C API bindings for Node.js — zero-copy inference via jude-map",
-  "main":  "./dist/index.js",
+  "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "type":  "module",
   "files": [
     "dist",
     "prebuilds",
@@ -14,11 +13,11 @@
     "README.md"
   ],
   "scripts": {
-    "build:ts":     "tsc",
+    "build:ts": "tsc",
     "build:native": "node-gyp rebuild",
-    "build":        "npm run build:ts && npm run build:native",
-    "test":         "node scripts/test.js",
-    "test:clean":   "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
+    "build": "npm run build:ts && npm run build:native",
+    "test": "node scripts/test.js",
+    "test:clean": "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
     "test:install": "node scripts/test-install.js",
     "prebuildify": "prebuildify --napi --strip --target 18.0.0 --target 20.0.0 --target 22.0.0 --target 24.0.0",
     "changeset": "changeset",
@@ -44,18 +43,18 @@
   "author": "Alan Kochukalam George",
   "license": "Apache-2.0",
   "peerDependencies": {
-    "jude-map": ">=0.0.0-alpha"
+    "jude-map": ">=0.1.0"
   },
   "dependencies": {
-    "node-addon-api":  "^8.6.0",
-    "node-gyp-build":  "^4.8.4"
+    "node-addon-api": "^8.6.0",
+    "node-gyp-build": "^4.8.4"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.30.0",
     "@types/node": "^25.0.0",
-    "tsx":         "^4.0.0",
-    "typescript":  "^5.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
     "prebuildify": "^6.0.1"
   },
   "repository": {
