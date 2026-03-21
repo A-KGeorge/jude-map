@@ -1,5 +1,11 @@
 # jude-map
 
+## 0.0.3
+
+### Patch Changes
+
+- [`6a9662d`](https://github.com/A-KGeorge/jude/commit/6a9662d12889d2a74afa25a467f53ca43bafd017) Thanks [@A-KGeorge](https://github.com/A-KGeorge)! - Updated directory
+
 ## 0.1.0
 
 ### Minor Changes
