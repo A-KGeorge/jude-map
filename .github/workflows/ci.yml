@@ -179,7 +179,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-jude-tf:
     name: "jude-tf / ${{ matrix.os }} / Node ${{ matrix.node }}"
-    needs: [changes, test-jude-map, install-libtensorflow]
+    needs: [changes, install-libtensorflow]
     if: |
       needs.changes.outputs.jude-tf == 'true' ||
       needs.changes.outputs.ci == 'true' ||
