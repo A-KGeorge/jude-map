@@ -16,7 +16,7 @@
     "build:ts": "tsc",
     "build:native": "node-gyp rebuild",
     "build": "npm run build:ts && npm run build:native",
-    "test": "node scripts/test.js",
+    "test": "node scripts/test.mjs",
     "test:clean": "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
     "test:install": "node scripts/test-install.js",
     "prebuildify": "prebuildify --napi --strip --target 18.0.0 --target 20.0.0 --target 22.0.0 --target 24.0.0",

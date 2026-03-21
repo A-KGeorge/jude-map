@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "install": "node scripts/install.js",
-    "test": "node scripts/test.js",
+    "test": "node scripts/test.mjs",
     "test:clean": "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
     "test:install": "node scripts/test-install.js",
     "build:ts": "tsc",
