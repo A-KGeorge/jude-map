@@ -11,10 +11,12 @@ async function loadTFSessionOrSkip(t: { skip: (message?: string) => void }) {
     const mod = await import("../index");
     return mod.TFSession;
   } catch (err: any) {
-    t.skip(
-      `native addon unavailable in test environment: ${err?.message ?? err}`,
-    );
-    return null;
+    const msg = `native addon unavailable in test environment: ${err?.message ?? err}`;
+    if (process.env.JUDE_TF_ALLOW_SKIP_NATIVE_TESTS === "1") {
+      t.skip(msg);
+      return null;
+    }
+    throw new Error(msg);
   }
 }
 
