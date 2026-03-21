@@ -17,7 +17,14 @@
     "build:ts":     "tsc",
     "build:native": "node-gyp rebuild",
     "build":        "npm run build:ts && npm run build:native",
-    "test":         "node --import tsx --test src/ts/__tests__/*.test.ts"
+    "test":         "node scripts/test.js",
+    "test:clean":   "node -e \"require('fs').rmSync('./test/test.db', { force: true })\" && npm test",
+    "test:install": "node scripts/test-install.js"
+  },
+  "binary": {
+    "napi_versions": [
+      8
+    ]
   },
   "engines": {
     "node": ">=18.0.0"
@@ -44,7 +51,13 @@
     "tsx":         "^4.0.0",
     "typescript":  "^5.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/A-KGeorge/jude-map.git"
+  },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
   }
 }
