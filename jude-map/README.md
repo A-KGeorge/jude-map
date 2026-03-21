@@ -245,7 +245,7 @@ The reader spins up to `READ_SPIN_LIMIT = 16` times on a torn read (writer mid-c
 ## Building from source
 
 ```bash
-git clone https://github.com/A-KGeorge/jude-map
+git clone https://github.com/A-KGeorge/jude
 cd jude-map
 npm install
 npm run build

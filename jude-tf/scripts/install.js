@@ -86,7 +86,7 @@ if (isArm) {
         "\nThis package requires prebuilt binaries or a C++ toolchain.",
       );
       console.error(
-        "   Please report this issue at: https://github.com/A-KGeorge/jude-map/issues",
+        "   Please report this issue at: https://github.com/A-KGeorge/jude/issues",
       );
       process.exit(1);
     }
