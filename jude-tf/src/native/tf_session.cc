@@ -1,4 +1,5 @@
 #include <napi.h>
+#include <uv.h>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -17,7 +18,6 @@
 // ---------------------------------------------------------------------------
 namespace
 {
-
     struct StatusGuard
     {
         TF_Status *s;
@@ -31,26 +31,7 @@ namespace
         std::string message() const { return TF_Message(s); }
     };
 
-    struct TensorGuard
-    {
-        TF_Tensor *t = nullptr;
-        explicit TensorGuard(TF_Tensor *t) : t(t) {}
-        ~TensorGuard()
-        {
-            if (t)
-                TF_DeleteTensor(t);
-        }
-        TF_Tensor *release()
-        {
-            auto *r = t;
-            t = nullptr;
-            return r;
-        }
-    };
-
-    // No-op deallocator — used when the tensor data is owned by jude-map mmap.
     void noop_deallocator(void *, size_t, void *) {}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -65,6 +46,7 @@ public:
                                                                 StaticMethod<&TFSession::LoadSavedModel>("loadSavedModel"),
                                                                 StaticMethod<&TFSession::LoadFrozenGraph>("loadFrozenGraph"),
                                                                 InstanceMethod<&TFSession::Run>("run"),
+                                                                InstanceMethod<&TFSession::RunAsync>("runAsync"),
                                                                 InstanceMethod<&TFSession::Destroy>("destroy"),
                                                                 InstanceAccessor<&TFSession::Signatures>("signatures"),
                                                                 InstanceAccessor<&TFSession::InferredInputs>("inputs"),
@@ -106,7 +88,162 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // TFSession.loadSavedModel(dir: string, tags?: string[]) → Promise<TFSession>
+    // build_run_args — shared input/output resolution (event loop thread only)
+    //
+    // Populates tf_inputs, tf_input_tensors, tf_outputs, output_keys.
+    // segment_refs accumulates ObjectReferences to any SharedTensorSegment
+    // objects so their mmap stays valid across the async gap in runAsync.
+    // Returns false and sets error_out on any validation failure.
+    // -----------------------------------------------------------------------
+    bool build_run_args(
+        Napi::Env env,
+        Napi::Object input_obj,
+        const Napi::Value &output_keys_val,
+        std::vector<TF_Output> &tf_inputs,
+        std::vector<TF_Tensor *> &tf_input_tensors,
+        std::vector<TF_Output> &tf_outputs,
+        std::vector<std::string> &output_keys,
+        std::vector<Napi::ObjectReference> &segment_refs,
+        std::string &error_out)
+    {
+        const jude_tf::SignatureDef *sig = nullptr;
+        if (!signatures_.empty())
+            sig = jude_tf::pick_signature(signatures_);
+
+        // ── inputs ──────────────────────────────────────────────────────────
+        Napi::Array input_key_arr = input_obj.GetPropertyNames();
+        for (uint32_t i = 0; i < input_key_arr.Length(); ++i)
+        {
+            std::string key = input_key_arr.Get(i).As<Napi::String>().Utf8Value();
+
+            std::string op_name;
+            int op_index = 0;
+            if (sig)
+            {
+                auto it = sig->inputs.find(key);
+                if (it == sig->inputs.end())
+                {
+                    error_out = "Unknown input key: " + key;
+                    return false;
+                }
+                op_name = it->second.name;
+                auto col = op_name.rfind(':');
+                if (col != std::string::npos)
+                {
+                    op_index = std::stoi(op_name.substr(col + 1));
+                    op_name = op_name.substr(0, col);
+                }
+            }
+            else
+            {
+                op_name = key;
+            }
+
+            TF_Operation *op = TF_GraphOperationByName(graph_, op_name.c_str());
+            if (!op)
+            {
+                error_out = "Graph op not found: " + op_name;
+                return false;
+            }
+            tf_inputs.push_back({op, op_index});
+
+            Napi::Value val = input_obj.Get(key);
+            TF_Tensor *tensor = make_tensor(env, val, sig, key, segment_refs);
+            if (!tensor)
+            {
+                error_out = "Failed to create tensor for input: " + key;
+                return false;
+            }
+            tf_input_tensors.push_back(tensor);
+        }
+
+        // ── outputs ─────────────────────────────────────────────────────────
+        bool user_specified = output_keys_val.IsArray();
+
+        if (sig)
+        {
+            if (user_specified)
+            {
+                auto arr = output_keys_val.As<Napi::Array>();
+                for (uint32_t i = 0; i < arr.Length(); ++i)
+                    output_keys.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
+            }
+            else
+            {
+                for (auto &[k, _] : sig->outputs)
+                    output_keys.push_back(k);
+            }
+
+            for (auto &key : output_keys)
+            {
+                auto it = sig->outputs.find(key);
+                if (it == sig->outputs.end())
+                {
+                    error_out = "Unknown output key: " + key;
+                    return false;
+                }
+                std::string op_name = it->second.name;
+                int op_idx = 0;
+                auto col = op_name.rfind(':');
+                if (col != std::string::npos)
+                {
+                    op_idx = std::stoi(op_name.substr(col + 1));
+                    op_name = op_name.substr(0, col);
+                }
+                TF_Operation *op = TF_GraphOperationByName(graph_, op_name.c_str());
+                if (!op)
+                {
+                    error_out = "Output op not found: " + op_name;
+                    return false;
+                }
+                tf_outputs.push_back({op, op_idx});
+            }
+        }
+        else
+        {
+            if (user_specified)
+            {
+                auto arr = output_keys_val.As<Napi::Array>();
+                for (uint32_t i = 0; i < arr.Length(); ++i)
+                    output_keys.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
+            }
+            else
+            {
+                output_keys = inferred_outputs_;
+            }
+
+            if (output_keys.empty())
+            {
+                error_out = "No output ops found. Pass output op names as the "
+                            "second argument to run() / runAsync().";
+                return false;
+            }
+
+            for (auto &key : output_keys)
+            {
+                std::string op_name = key;
+                int op_idx = 0;
+                auto col = op_name.rfind(':');
+                if (col != std::string::npos)
+                {
+                    op_idx = std::stoi(op_name.substr(col + 1));
+                    op_name = op_name.substr(0, col);
+                }
+                TF_Operation *op = TF_GraphOperationByName(graph_, op_name.c_str());
+                if (!op)
+                {
+                    error_out = "Output op not found: " + op_name;
+                    return false;
+                }
+                tf_outputs.push_back({op, op_idx});
+            }
+        }
+
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // loadSavedModel
     // -----------------------------------------------------------------------
     static Napi::Value LoadSavedModel(const Napi::CallbackInfo &info)
     {
@@ -119,27 +256,23 @@ private:
         }
 
         std::string dir = info[0].As<Napi::String>().Utf8Value();
-
         std::vector<std::string> tags = {"serve"};
         if (info.Length() >= 2 && info[1].IsArray())
         {
-            Napi::Array arr = info[1].As<Napi::Array>();
+            auto arr = info[1].As<Napi::Array>();
             tags.clear();
             for (uint32_t i = 0; i < arr.Length(); ++i)
                 tags.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
         }
 
         auto deferred = Napi::Promise::Deferred::New(env);
-
         auto *ctor = env.GetInstanceData<Napi::FunctionReference>();
         Napi::Object obj = ctor->New({});
         TFSession *self = Unwrap(obj);
 
         self->graph_ = TF_NewGraph();
-
         TF_SessionOptions *opts = TF_NewSessionOptions();
         std::vector<const char *> tag_ptrs;
-        tag_ptrs.reserve(tags.size());
         for (auto &t : tags)
             tag_ptrs.push_back(t.c_str());
 
@@ -148,10 +281,7 @@ private:
             opts, nullptr,
             dir.c_str(),
             tag_ptrs.data(), static_cast<int>(tag_ptrs.size()),
-            self->graph_,
-            nullptr,
-            status.s);
-
+            self->graph_, nullptr, status.s);
         TF_DeleteSessionOptions(opts);
 
         if (!status.ok())
@@ -167,11 +297,11 @@ private:
         std::ifstream pb_file(pb_path, std::ios::binary | std::ios::ate);
         if (pb_file.is_open())
         {
-            size_t size = static_cast<size_t>(pb_file.tellg());
+            size_t sz = static_cast<size_t>(pb_file.tellg());
             pb_file.seekg(0);
-            std::vector<uint8_t> buf(size);
-            pb_file.read(reinterpret_cast<char *>(buf.data()), size);
-            jude_tf::parse_saved_model(buf.data(), size, self->signatures_);
+            std::vector<uint8_t> buf(sz);
+            pb_file.read(reinterpret_cast<char *>(buf.data()), sz);
+            jude_tf::parse_saved_model(buf.data(), sz, self->signatures_);
         }
 
         deferred.Resolve(obj);
@@ -179,7 +309,7 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // TFSession.loadFrozenGraph(path: string) → Promise<TFSession>
+    // loadFrozenGraph
     // -----------------------------------------------------------------------
     static Napi::Value LoadFrozenGraph(const Napi::CallbackInfo &info)
     {
@@ -193,7 +323,6 @@ private:
 
         std::string path = info[0].As<Napi::String>().Utf8Value();
         auto deferred = Napi::Promise::Deferred::New(env);
-
         auto *ctor = env.GetInstanceData<Napi::FunctionReference>();
         Napi::Object obj = ctor->New({});
         TFSession *self = Unwrap(obj);
@@ -206,12 +335,12 @@ private:
                                 .Value());
             return deferred.Promise();
         }
-        size_t size = static_cast<size_t>(f.tellg());
+        size_t sz = static_cast<size_t>(f.tellg());
         f.seekg(0);
-        std::vector<char> raw(size);
-        f.read(raw.data(), size);
+        std::vector<char> raw(sz);
+        f.read(raw.data(), sz);
 
-        TF_Buffer *graph_buf = TF_NewBufferFromString(raw.data(), size);
+        TF_Buffer *graph_buf = TF_NewBufferFromString(raw.data(), sz);
         self->graph_ = TF_NewGraph();
 
         TF_ImportGraphDefOptions *import_opts = TF_NewImportGraphDefOptions();
@@ -280,33 +409,6 @@ private:
             "_Retval",
             "IdentityN",
         };
-
-        size_t pos = 0;
-        TF_Operation *op;
-        while ((op = TF_GraphNextOperation(graph_, &pos)) != nullptr)
-        {
-            all_ops.push_back(op);
-
-            const char *type = TF_OperationOpType(op);
-            if (strcmp(type, "Placeholder") == 0)
-                inferred_inputs_.emplace_back(TF_OperationName(op));
-
-            // Ignore infra consumers so terminal compute ops (often Identity)
-            // remain discoverable as outputs for frozen graphs.
-            if (non_semantic_consumers.count(type))
-                continue;
-
-            // Mark every op that feeds into this op as consumed.
-            int n_inputs = TF_OperationNumInputs(op);
-            for (int i = 0; i < n_inputs; ++i)
-            {
-                TF_Output src = TF_OperationInput({op, i});
-                if (src.oper)
-                    consumed.emplace(TF_OperationName(src.oper));
-            }
-        }
-
-        // Pass 2: unclaimed non-infrastructure ops are outputs.
         static const std::unordered_set<std::string> skip_types = {
             "Placeholder",
             "Const",
@@ -319,11 +421,34 @@ private:
             "AssignVariableOp",
         };
 
+        size_t pos = 0;
+        TF_Operation *op;
+        while ((op = TF_GraphNextOperation(graph_, &pos)) != nullptr)
+        {
+            all_ops.push_back(op);
+            const char *type = TF_OperationOpType(op);
+
+            if (strcmp(type, "Placeholder") == 0)
+                inferred_inputs_.emplace_back(TF_OperationName(op));
+
+            // Ignore infra consumers so terminal compute ops (often Identity)
+            // remain discoverable as outputs for frozen graphs.
+            if (non_semantic_consumers.count(type))
+                continue;
+
+            int n = TF_OperationNumInputs(op);
+            for (int i = 0; i < n; ++i)
+            {
+                TF_Output src = TF_OperationInput({op, i});
+                if (src.oper)
+                    consumed.emplace(TF_OperationName(src.oper));
+            }
+        }
+
         for (auto *o : all_ops)
         {
             const char *type = TF_OperationOpType(o);
             const char *name = TF_OperationName(o);
-
             if (skip_types.count(type))
                 continue;
             if (consumed.count(name))
@@ -332,13 +457,12 @@ private:
             // Ops whose name starts with ^ are control edges — skip.
             if (name[0] == '^')
                 continue;
-
             inferred_outputs_.emplace_back(name);
         }
     }
 
     // -----------------------------------------------------------------------
-    // sess.run(inputs, outputKeys?) → Promise<Record<string, TensorResult>>
+    // run — synchronous (blocks event loop during TF_SessionRun)
     // -----------------------------------------------------------------------
     Napi::Value Run(const Napi::CallbackInfo &info)
     {
@@ -358,177 +482,30 @@ private:
             return deferred.Promise();
         }
 
-        const jude_tf::SignatureDef *sig = nullptr;
-        if (!signatures_.empty())
-            sig = jude_tf::pick_signature(signatures_);
-
-        Napi::Object input_obj = info[0].As<Napi::Object>();
-        Napi::Array input_keys = input_obj.GetPropertyNames();
-
-        // Build TF input tensors.
-        std::vector<TF_Output> tf_inputs;
+        std::vector<TF_Output> tf_inputs, tf_outputs;
         std::vector<TF_Tensor *> tf_input_tensors;
-
-        for (uint32_t i = 0; i < input_keys.Length(); ++i)
-        {
-            std::string key = input_keys.Get(i).As<Napi::String>().Utf8Value();
-
-            std::string op_name;
-            int op_index = 0;
-            if (sig)
-            {
-                auto it = sig->inputs.find(key);
-                if (it == sig->inputs.end())
-                {
-                    deferred.Reject(Napi::Error::New(env,
-                                                     "Unknown input key: " + key)
-                                        .Value());
-                    return deferred.Promise();
-                }
-                op_name = it->second.name;
-                auto col = op_name.rfind(':');
-                if (col != std::string::npos)
-                {
-                    op_index = std::stoi(op_name.substr(col + 1));
-                    op_name = op_name.substr(0, col);
-                }
-            }
-            else
-            {
-                // Frozen graph: key IS the op name.
-                op_name = key;
-            }
-
-            TF_Operation *op = TF_GraphOperationByName(graph_, op_name.c_str());
-            if (!op)
-            {
-                deferred.Reject(Napi::Error::New(env,
-                                                 "Graph op not found: " + op_name)
-                                    .Value());
-                return deferred.Promise();
-            }
-            tf_inputs.push_back({op, op_index});
-
-            Napi::Value val = input_obj.Get(key);
-            TF_Tensor *tensor = make_tensor(env, val, sig, key);
-            if (!tensor)
-            {
-                deferred.Reject(Napi::Error::New(env,
-                                                 "Failed to create tensor for input: " + key)
-                                    .Value());
-                return deferred.Promise();
-            }
-            tf_input_tensors.push_back(tensor);
-        }
-
-        // Build TF output specs.
-        std::vector<TF_Output> tf_outputs;
         std::vector<std::string> output_keys;
+        std::vector<Napi::ObjectReference> segment_refs;
+        std::string error;
 
-        if (sig)
+        Napi::Value out_val = (info.Length() >= 2) ? info[1] : env.Undefined();
+        if (!build_run_args(env, info[0].As<Napi::Object>(), out_val,
+                            tf_inputs, tf_input_tensors, tf_outputs, output_keys,
+                            segment_refs, error))
         {
-            // SavedModel path: resolve outputs from SignatureDef.
-            bool user_specified = (info.Length() >= 2 && info[1].IsArray());
-            if (user_specified)
-            {
-                Napi::Array arr = info[1].As<Napi::Array>();
-                for (uint32_t i = 0; i < arr.Length(); ++i)
-                    output_keys.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
-            }
-            else
-            {
-                for (auto &[k, _] : sig->outputs)
-                    output_keys.push_back(k);
-            }
-            for (auto &key : output_keys)
-            {
-                auto it = sig->outputs.find(key);
-                if (it == sig->outputs.end())
-                {
-                    deferred.Reject(Napi::Error::New(env,
-                                                     "Unknown output key: " + key)
-                                        .Value());
-                    return deferred.Promise();
-                }
-                std::string op_name = it->second.name;
-                int op_idx = 0;
-                auto col = op_name.rfind(':');
-                if (col != std::string::npos)
-                {
-                    op_idx = std::stoi(op_name.substr(col + 1));
-                    op_name = op_name.substr(0, col);
-                }
-                TF_Operation *op = TF_GraphOperationByName(graph_, op_name.c_str());
-                if (!op)
-                {
-                    deferred.Reject(Napi::Error::New(env,
-                                                     "Output op not found: " + op_name)
-                                        .Value());
-                    return deferred.Promise();
-                }
-                tf_outputs.push_back({op, op_idx});
-            }
-        }
-        else
-        {
-            // Frozen graph path: use inferred outputs or caller-supplied keys.
-            bool user_specified = (info.Length() >= 2 && info[1].IsArray());
-            if (user_specified)
-            {
-                Napi::Array arr = info[1].As<Napi::Array>();
-                for (uint32_t i = 0; i < arr.Length(); ++i)
-                    output_keys.push_back(arr.Get(i).As<Napi::String>().Utf8Value());
-            }
-            else
-            {
-                output_keys = inferred_outputs_;
-            }
-
-            if (output_keys.empty())
-            {
-                deferred.Reject(Napi::Error::New(env,
-                                                 "No output ops found in frozen graph. "
-                                                 "Pass output op names explicitly as the second argument to run().")
-                                    .Value());
-                return deferred.Promise();
-            }
-
-            for (auto &key : output_keys)
-            {
-                // Support "op_name:index" format.
-                std::string op_name = key;
-                int op_idx = 0;
-                auto col = op_name.rfind(':');
-                if (col != std::string::npos)
-                {
-                    op_idx = std::stoi(op_name.substr(col + 1));
-                    op_name = op_name.substr(0, col);
-                }
-                TF_Operation *op = TF_GraphOperationByName(graph_, op_name.c_str());
-                if (!op)
-                {
-                    deferred.Reject(Napi::Error::New(env,
-                                                     "Output op not found: " + op_name)
-                                        .Value());
-                    return deferred.Promise();
-                }
-                tf_outputs.push_back({op, op_idx});
-            }
+            deferred.Reject(Napi::Error::New(env, error).Value());
+            return deferred.Promise();
         }
 
         std::vector<TF_Tensor *> output_tensors(tf_outputs.size(), nullptr);
-
         StatusGuard status;
         TF_SessionRun(
-            session_,
-            nullptr,
+            session_, nullptr,
             tf_inputs.data(), tf_input_tensors.data(),
             static_cast<int>(tf_inputs.size()),
             tf_outputs.data(), output_tensors.data(),
             static_cast<int>(tf_outputs.size()),
-            nullptr, 0,
-            nullptr,
-            status.s);
+            nullptr, 0, nullptr, status.s);
 
         for (auto *t : tf_input_tensors)
             TF_DeleteTensor(t);
@@ -547,11 +524,10 @@ private:
         Napi::Object result = Napi::Object::New(env);
         for (size_t i = 0; i < output_tensors.size(); ++i)
         {
-            TF_Tensor *t = output_tensors[i];
-            if (!t)
+            if (!output_tensors[i])
                 continue;
-            result.Set(output_keys[i], tensor_to_js(env, t));
-            TF_DeleteTensor(t);
+            result.Set(output_keys[i], tensor_to_js(env, output_tensors[i]));
+            TF_DeleteTensor(output_tensors[i]);
         }
 
         deferred.Resolve(result);
@@ -559,14 +535,189 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // Helpers
+    // runAsync — TF_SessionRun on libuv thread pool
+    //
+    // Phase 1 (event loop thread):
+    //   build_run_args — all V8 access. Resolves op names, allocates input
+    //   TF_Tensors, extracts zero-copy pointers, anchors segment lifetimes.
+    //   After this, ctx contains only raw C pointers and TF objects — safe
+    //   to hand to the thread pool.
+    //
+    // Phase 2 (libuv thread pool — OnRunWork):
+    //   TF_SessionRun — pure C, no V8. May run concurrently with JS.
+    //
+    // Phase 3 (event loop thread — OnRunAfter):
+    //   tensor_to_js, resolve/reject Promise. Release all resources.
     // -----------------------------------------------------------------------
+    struct RunWorkCtx
+    {
+        uv_work_t req; // must be first — libuv casts req* → RunWorkCtx*
 
+        TF_Session *session; // raw pointer, kept alive by self_ref
+
+        // Pre-built args (event loop thread → thread pool)
+        std::vector<TF_Output> tf_inputs;
+        std::vector<TF_Tensor *> tf_input_tensors; // owned, deleted in OnRunAfter
+        std::vector<TF_Output> tf_outputs;
+        std::vector<std::string> output_keys;
+
+        // Filled by OnRunWork
+        std::vector<TF_Tensor *> output_tensors;
+
+        // Zero-copy lifetime anchors.
+        // Each ref keeps a SharedTensorSegment JS object (and its mmap) alive
+        // across the async gap. Released in OnRunAfter after TF_SessionRun
+        // returns — at that point TF has finished reading the buffer.
+        std::vector<Napi::ObjectReference> segment_refs;
+
+        bool ok = true;
+        std::string error_message;
+
+        Napi::Promise::Deferred deferred;
+        Napi::ObjectReference self_ref; // keeps TFSession JS object alive
+        TFSession *owner;               // for tensor_to_js in OnRunAfter
+
+        explicit RunWorkCtx(Napi::Env env)
+            : req{}, session(nullptr),
+              deferred(Napi::Promise::Deferred::New(env)),
+              owner(nullptr)
+        {
+        }
+    };
+
+    static void OnRunWork(uv_work_t *req)
+    {
+        // Thread pool — NO V8 access.
+        auto *ctx = reinterpret_cast<RunWorkCtx *>(req);
+        ctx->output_tensors.assign(ctx->tf_outputs.size(), nullptr);
+
+        StatusGuard status;
+        TF_SessionRun(
+            ctx->session, nullptr,
+            ctx->tf_inputs.data(), ctx->tf_input_tensors.data(),
+            static_cast<int>(ctx->tf_inputs.size()),
+            ctx->tf_outputs.data(), ctx->output_tensors.data(),
+            static_cast<int>(ctx->tf_outputs.size()),
+            nullptr, 0, nullptr, status.s);
+
+        if (!status.ok())
+        {
+            ctx->ok = false;
+            ctx->error_message = status.message();
+        }
+    }
+
+    static void OnRunAfter(uv_work_t *req, int /*status*/)
+    {
+        // Event loop thread — V8 access safe.
+        auto *ctx = reinterpret_cast<RunWorkCtx *>(req);
+        Napi::Env env = ctx->deferred.Env();
+        Napi::HandleScope scope(env);
+
+        // Free input tensors regardless of outcome.
+        for (auto *t : ctx->tf_input_tensors)
+            TF_DeleteTensor(t);
+
+        // segment_refs destructors run here — mmap stays valid until this point,
+        // which is after TF_SessionRun has returned in OnRunWork.
+        // self_ref destructor keeps TFSession alive through Unref below.
+
+        if (!ctx->ok)
+        {
+            for (auto *t : ctx->output_tensors)
+                if (t)
+                    TF_DeleteTensor(t);
+            ctx->deferred.Reject(Napi::Error::New(env,
+                                                  "TF_SessionRun failed: " + ctx->error_message)
+                                     .Value());
+        }
+        else
+        {
+            Napi::Object result = Napi::Object::New(env);
+            for (size_t i = 0; i < ctx->output_tensors.size(); ++i)
+            {
+                TF_Tensor *t = ctx->output_tensors[i];
+                if (!t)
+                    continue;
+                result.Set(ctx->output_keys[i], ctx->owner->tensor_to_js(env, t));
+                TF_DeleteTensor(t);
+            }
+            ctx->deferred.Resolve(result);
+        }
+
+        ctx->self_ref.Unref();
+        delete ctx;
+    }
+
+    Napi::Value RunAsync(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+
+        if (!session_)
+        {
+            auto d = Napi::Promise::Deferred::New(env);
+            d.Reject(Napi::Error::New(env, "Session destroyed").Value());
+            return d.Promise();
+        }
+        if (info.Length() < 1 || !info[0].IsObject())
+        {
+            auto d = Napi::Promise::Deferred::New(env);
+            d.Reject(Napi::TypeError::New(env,
+                                          "runAsync(inputs: Record<string, ...>)")
+                         .Value());
+            return d.Promise();
+        }
+
+        auto *ctx = new RunWorkCtx(env);
+        ctx->session = session_;
+        ctx->owner = this;
+        ctx->self_ref = Napi::ObjectReference::New(
+            info.This().As<Napi::Object>(), 1);
+
+        // Phase 1: all V8 work on event loop thread.
+        Napi::Value out_val = (info.Length() >= 2) ? info[1] : env.Undefined();
+        std::string error;
+        if (!build_run_args(
+                env, info[0].As<Napi::Object>(), out_val,
+                ctx->tf_inputs, ctx->tf_input_tensors,
+                ctx->tf_outputs, ctx->output_keys,
+                ctx->segment_refs, error))
+        {
+            auto promise = ctx->deferred.Promise();
+            ctx->deferred.Reject(Napi::Error::New(env, error).Value());
+            ctx->self_ref.Unref();
+            delete ctx;
+            return promise;
+        }
+
+        uv_loop_t *loop = nullptr;
+        if (napi_get_uv_event_loop(env, &loop) != napi_ok || !loop ||
+            uv_queue_work(loop, &ctx->req, OnRunWork, OnRunAfter) != 0)
+        {
+            // Fallback: synchronous if queue fails.
+            for (auto *t : ctx->tf_input_tensors)
+                TF_DeleteTensor(t);
+            auto promise = ctx->deferred.Promise();
+            ctx->deferred.Reject(Napi::Error::New(env,
+                                                  "Failed to queue runAsync work")
+                                     .Value());
+            ctx->self_ref.Unref();
+            delete ctx;
+            return promise;
+        }
+
+        return ctx->deferred.Promise();
+    }
+
+    // -----------------------------------------------------------------------
+    // make_tensor
+    // -----------------------------------------------------------------------
     TF_Tensor *make_tensor(
         Napi::Env env,
         Napi::Value val,
         const jude_tf::SignatureDef *sig,
-        const std::string &key)
+        const std::string &key,
+        std::vector<Napi::ObjectReference> &segment_refs)
     {
         if (val.IsTypedArray())
         {
@@ -574,30 +725,26 @@ private:
             TF_DataType dtype = js_typed_array_dtype(ta.TypedArrayType());
 
             std::vector<int64_t> dims;
-
             if (sig)
             {
                 auto it = sig->inputs.find(key);
                 if (it != sig->inputs.end())
-                {
                     dims = it->second.shape.dims;
-                }
             }
             else
             {
-                // Frozen graph path: infer placeholder shape directly from graph.
                 TF_Operation *op = TF_GraphOperationByName(graph_, key.c_str());
                 if (op)
                 {
                     TF_Output out{op, 0};
-                    StatusGuard n_dims_status;
-                    int n_dims = TF_GraphGetTensorNumDims(graph_, out, n_dims_status.s);
-                    if (n_dims_status.ok() && n_dims > 0)
+                    StatusGuard sg;
+                    int n = TF_GraphGetTensorNumDims(graph_, out, sg.s);
+                    if (sg.ok() && n > 0)
                     {
-                        dims.resize(static_cast<size_t>(n_dims), -1);
-                        StatusGuard shape_status;
-                        TF_GraphGetTensorShape(graph_, out, dims.data(), n_dims, shape_status.s);
-                        if (!shape_status.ok())
+                        dims.resize(static_cast<size_t>(n), -1);
+                        StatusGuard sg2;
+                        TF_GraphGetTensorShape(graph_, out, dims.data(), n, sg2.s);
+                        if (!sg2.ok())
                             dims.clear();
                     }
                 }
@@ -609,43 +756,31 @@ private:
             }
             else
             {
-                // Replace unknown dimensions with a concrete testable shape.
-                int64_t total_elems = static_cast<int64_t>(ta.ElementLength());
-                int unknown_count = 0;
-                int unknown_index = -1;
-                int64_t known_product = 1;
-
-                for (size_t i = 0; i < dims.size(); ++i)
+                int64_t total = static_cast<int64_t>(ta.ElementLength());
+                int unk_count = 0, unk_idx = -1;
+                int64_t known = 1;
+                for (int i = 0; i < static_cast<int>(dims.size()); ++i)
                 {
                     if (dims[i] < 1)
                     {
-                        unknown_count++;
-                        unknown_index = static_cast<int>(i);
+                        unk_count++;
+                        unk_idx = i;
                     }
                     else
                     {
-                        known_product *= dims[i];
+                        known *= dims[i];
                     }
                 }
-
-                if (unknown_count == 1 && known_product > 0 && total_elems % known_product == 0)
-                {
-                    dims[unknown_index] = total_elems / known_product;
-                }
+                if (unk_count == 1 && known > 0 && total % known == 0)
+                    dims[unk_idx] = total / known;
                 else
-                {
                     for (auto &d : dims)
-                    {
                         if (d < 1)
                             d = 1;
-                    }
-                }
             }
 
             TF_Tensor *t = TF_AllocateTensor(
-                dtype,
-                dims.data(),
-                static_cast<int>(dims.size()),
+                dtype, dims.data(), static_cast<int>(dims.size()),
                 ta.ByteLength());
             if (!t)
                 return nullptr;
@@ -660,11 +795,11 @@ private:
             Napi::Object obj = val.As<Napi::Object>();
             if (obj.Has("read") && obj.Get("read").IsFunction())
             {
-                Napi::Value result = obj.Get("read").As<Napi::Function>().Call(obj, {});
-                if (result.IsNull() || result.IsUndefined())
+                Napi::Value res = obj.Get("read").As<Napi::Function>().Call(obj, {});
+                if (res.IsNull() || res.IsUndefined())
                     return nullptr;
 
-                Napi::Object r = result.As<Napi::Object>();
+                Napi::Object r = res.As<Napi::Object>();
                 Napi::Array shape_arr = r.Get("shape").As<Napi::Array>();
                 int dtype_id = r.Get("dtype").As<Napi::Number>().Int32Value();
 
@@ -673,16 +808,17 @@ private:
 
                 if (r.Has("buffer") && r.Get("buffer").IsArrayBuffer())
                 {
-                    Napi::ArrayBuffer ab = r.Get("buffer").As<Napi::ArrayBuffer>();
+                    auto ab = r.Get("buffer").As<Napi::ArrayBuffer>();
                     data_ptr = ab.Data();
                     data_len = ab.ByteLength();
                 }
                 else if (r.Has("data") && r.Get("data").IsTypedArray())
                 {
-                    Napi::TypedArray ta = r.Get("data").As<Napi::TypedArray>();
-                    Napi::ArrayBuffer ab = ta.ArrayBuffer();
-                    data_ptr = reinterpret_cast<uint8_t *>(ab.Data()) + ta.ByteOffset();
-                    data_len = ta.ByteLength();
+                    auto ta2 = r.Get("data").As<Napi::TypedArray>();
+                    data_ptr = reinterpret_cast<uint8_t *>(
+                                   ta2.ArrayBuffer().Data()) +
+                               ta2.ByteOffset();
+                    data_len = ta2.ByteLength();
                 }
                 else
                 {
@@ -695,65 +831,69 @@ private:
                     dims.push_back(static_cast<int64_t>(
                         shape_arr.Get(i).As<Napi::Number>().Int64Value()));
 
-                TF_DataType tf_dtype = static_cast<TF_DataType>(jude_dtype_to_tf(dtype_id));
+                TF_DataType tf_dtype = static_cast<TF_DataType>(
+                    jude_dtype_to_tf(dtype_id));
 
-                TF_Tensor *t = TF_NewTensor(
+                // Anchor the segment so the mmap survives the async gap.
+                segment_refs.push_back(Napi::ObjectReference::New(obj, 1));
+
+                return TF_NewTensor(
                     tf_dtype, dims.data(), static_cast<int>(dims.size()),
-                    data_ptr, data_len,
-                    noop_deallocator, nullptr);
-                return t;
+                    data_ptr, data_len, noop_deallocator, nullptr);
             }
         }
         return nullptr;
     }
 
+    // -----------------------------------------------------------------------
+    // Output helpers
+    // -----------------------------------------------------------------------
     Napi::Object tensor_to_js(Napi::Env env, TF_Tensor *t)
     {
         Napi::Object obj = Napi::Object::New(env);
-
         TF_DataType dtype = TF_TensorType(t);
-        int n_dims = TF_NumDims(t);
-        size_t nbytes = TF_TensorByteSize(t);
+        int ndims = TF_NumDims(t);
+        size_t nb = TF_TensorByteSize(t);
 
-        Napi::Array shape = Napi::Array::New(env, n_dims);
-        for (int i = 0; i < n_dims; ++i)
-            shape.Set(i, Napi::Number::New(env, static_cast<double>(TF_Dim(t, i))));
+        Napi::Array shape = Napi::Array::New(env, ndims);
+        for (int i = 0; i < ndims; ++i)
+            shape.Set(i, Napi::Number::New(env,
+                                           static_cast<double>(TF_Dim(t, i))));
 
         obj.Set("dtype", Napi::Number::New(env, static_cast<double>(dtype)));
         obj.Set("shape", shape);
 
-        Napi::ArrayBuffer buf = Napi::ArrayBuffer::New(env, nbytes);
-        std::memcpy(buf.Data(), TF_TensorData(t), nbytes);
-        obj.Set("data", tf_dtype_to_typed_array(env, dtype, buf, nbytes));
+        Napi::ArrayBuffer buf = Napi::ArrayBuffer::New(env, nb);
+        std::memcpy(buf.Data(), TF_TensorData(t), nb);
+        obj.Set("data", tf_dtype_to_typed_array(env, dtype, buf, nb));
         return obj;
     }
 
     Napi::Value tf_dtype_to_typed_array(
-        Napi::Env env, TF_DataType dtype,
-        Napi::ArrayBuffer buf, size_t nbytes)
+        Napi::Env env, TF_DataType dtype, Napi::ArrayBuffer buf, size_t nb)
     {
         switch (dtype)
         {
         case TF_FLOAT:
-            return Napi::Float32Array::New(env, nbytes / 4, buf, 0);
+            return Napi::Float32Array::New(env, nb / 4, buf, 0);
         case TF_DOUBLE:
-            return Napi::Float64Array::New(env, nbytes / 8, buf, 0);
+            return Napi::Float64Array::New(env, nb / 8, buf, 0);
         case TF_INT32:
-            return Napi::Int32Array::New(env, nbytes / 4, buf, 0);
+            return Napi::Int32Array::New(env, nb / 4, buf, 0);
         case TF_UINT8:
-            return Napi::Uint8Array::New(env, nbytes / 1, buf, 0);
+            return Napi::Uint8Array::New(env, nb / 1, buf, 0);
         case TF_INT8:
-            return Napi::Int8Array::New(env, nbytes / 1, buf, 0);
+            return Napi::Int8Array::New(env, nb / 1, buf, 0);
         case TF_UINT16:
-            return Napi::Uint16Array::New(env, nbytes / 2, buf, 0);
+            return Napi::Uint16Array::New(env, nb / 2, buf, 0);
         case TF_INT16:
-            return Napi::Int16Array::New(env, nbytes / 2, buf, 0);
+            return Napi::Int16Array::New(env, nb / 2, buf, 0);
         default:
             return buf;
         }
     }
 
-    static int jude_dtype_to_tf(int dtype_id)
+    static int jude_dtype_to_tf(int id)
     {
         static const int map[] = {
             TF_FLOAT,
@@ -766,14 +906,12 @@ private:
             TF_INT16,
             TF_BOOL,
         };
-        if (dtype_id >= 0 && dtype_id < 9)
-            return map[dtype_id];
-        return TF_FLOAT;
+        return (id >= 0 && id < 9) ? map[id] : TF_FLOAT;
     }
 
-    static TF_DataType js_typed_array_dtype(napi_typedarray_type type)
+    static TF_DataType js_typed_array_dtype(napi_typedarray_type t)
     {
-        switch (type)
+        switch (t)
         {
         case napi_float32_array:
             return TF_FLOAT;
@@ -794,45 +932,42 @@ private:
         }
     }
 
-    // sess.signatures → all SignatureDefs (SavedModel only)
+    // -----------------------------------------------------------------------
+    // Accessors
+    // -----------------------------------------------------------------------
     Napi::Value Signatures(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
         Napi::Object out = Napi::Object::New(env);
-
         for (auto &[sig_key, sig] : signatures_)
         {
             Napi::Object sig_obj = Napi::Object::New(env);
-
-            auto make_tensor_map = [&](
-                                       const std::unordered_map<std::string, jude_tf::TensorInfo> &map)
+            auto make_map = [&](
+                                const std::unordered_map<std::string, jude_tf::TensorInfo> &m)
             {
-                Napi::Object m = Napi::Object::New(env);
-                for (auto &[k, ti] : map)
+                Napi::Object mo = Napi::Object::New(env);
+                for (auto &[k, ti] : m)
                 {
-                    Napi::Object info_obj = Napi::Object::New(env);
-                    info_obj.Set("name", Napi::String::New(env, ti.name));
-                    info_obj.Set("dtype", Napi::Number::New(env, ti.dtype));
-
+                    Napi::Object io = Napi::Object::New(env);
+                    io.Set("name", Napi::String::New(env, ti.name));
+                    io.Set("dtype", Napi::Number::New(env, ti.dtype));
                     Napi::Array dims = Napi::Array::New(env, ti.shape.dims.size());
                     for (size_t i = 0; i < ti.shape.dims.size(); ++i)
                         dims.Set(i, Napi::Number::New(env,
                                                       static_cast<double>(ti.shape.dims[i])));
-                    info_obj.Set("shape", dims);
-                    m.Set(k, info_obj);
+                    io.Set("shape", dims);
+                    mo.Set(k, io);
                 }
-                return m;
+                return mo;
             };
-
-            sig_obj.Set("inputs", make_tensor_map(sig.inputs));
-            sig_obj.Set("outputs", make_tensor_map(sig.outputs));
+            sig_obj.Set("inputs", make_map(sig.inputs));
+            sig_obj.Set("outputs", make_map(sig.outputs));
             sig_obj.Set("methodName", Napi::String::New(env, sig.method_name));
             out.Set(sig_key, sig_obj);
         }
         return out;
     }
 
-    // sess.inputs → string[] of inferred Placeholder op names (frozen graphs)
     Napi::Value InferredInputs(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
@@ -842,7 +977,6 @@ private:
         return arr;
     }
 
-    // sess.outputs → string[] of inferred output op names (frozen graphs)
     Napi::Value InferredOutputs(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
@@ -856,11 +990,8 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Module entry
-// ---------------------------------------------------------------------------
 Napi::Object InitAll(Napi::Env env, Napi::Object exports)
 {
     return TFSession::Init(env, exports);
 }
-
 NODE_API_MODULE(jude_tf, InitAll)

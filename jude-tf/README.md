@@ -253,7 +253,8 @@ On Windows set `LIBTENSORFLOW_PATH` as a user environment variable rather than i
 - [x] Zero-copy inference from jude-map segments
 - [x] TypedArray input path (copy)
 - [x] CPU inference
-- [ ] `runAsync()` — `TF_SessionRun` on libuv thread pool (event loop free during inference)
+- [x] `runAsync()` — `TF_SessionRun` on libuv thread pool (event loop free during inference)
+- [ ] SavedModel variable restoration (ResourceVariable checkpoint loading via C API)
 - [ ] GPU inference path (CUDA session options, `TF_GPU_THREAD_MODE`)
 - [ ] TFLite (separate target, different C API)
 

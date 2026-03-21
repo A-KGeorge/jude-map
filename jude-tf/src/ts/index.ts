@@ -129,6 +129,26 @@ export class TFSession {
     return new TFSession(native);
   }
 
+  /**
+   * Non-blocking inference. TF_SessionRun runs on the libuv thread pool —
+   * the event loop stays free for I/O, timers, and other work during inference.
+   *
+   * Use this on the main thread. Use run() on Worker threads where blocking
+   * the isolated event loop is acceptable.
+   *
+   * @example
+   * // Event loop alive throughout — timers and I/O continue during inference
+   * const result = await sess.runAsync({ inputs: segment });
+   */
+  async runAsync(
+    inputs: Record<string, TensorInput>,
+    outputKeys?: string[],
+  ): Promise<Record<string, TensorResult>> {
+    return outputKeys
+      ? this._native.runAsync(inputs, outputKeys)
+      : this._native.runAsync(inputs);
+  }
+
   // -------------------------------------------------------------------------
   // Inference
   // -------------------------------------------------------------------------
