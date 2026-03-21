@@ -8,12 +8,33 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 let addon: any;
+const builtLayoutRoot = join(__dirname, "..");
+const sourceLayoutRoot = join(__dirname, "..", "..");
+
+function isNoNativeBuildError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes("No native build was found for");
+}
+
 try {
   // Built package layout: dist -> package root.
-  addon = nodeGypBuild(join(__dirname, "..")) as any;
-} catch {
-  // Source test layout: src/ts -> package root.
-  addon = nodeGypBuild(join(__dirname, "..", "..")) as any;
+  addon = nodeGypBuild(builtLayoutRoot) as any;
+} catch (firstErr) {
+  // Fall back only when the built-layout path truly has no matching prebuild.
+  // For other failures (e.g. missing dependent DLLs), keep the original error.
+  if (!isNoNativeBuildError(firstErr)) {
+    throw firstErr;
+  }
+
+  try {
+    // Source test layout: src/ts -> package root.
+    addon = nodeGypBuild(sourceLayoutRoot) as any;
+  } catch (secondErr) {
+    if (isNoNativeBuildError(secondErr)) {
+      throw secondErr;
+    }
+    throw firstErr;
+  }
 }
 const { TFSession: NativeTFSession } = addon;
 
