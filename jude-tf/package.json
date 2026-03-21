@@ -1,6 +1,6 @@
 {
   "name": "jude-tf",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "TensorFlow C API bindings for Node.js — zero-copy inference via jude-map",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
