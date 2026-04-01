@@ -159,8 +159,8 @@ public:
                 max_bytes_ = sab_bytes - DATA_OFFSET;
                 is_sab_backed_ = true;
 
-                // Persist the underlying SAB so V8 doesn't GC it while we hold mapped_.
-                napi_create_reference(env, u8a.ArrayBuffer(), 1, &sab_napi_ref_);
+                // Constructor — reference the TypedArray, not its .ArrayBuffer()
+                napi_create_reference(env, info[0], 1, &sab_napi_ref_);
 
                 if (init_header)
                 {
@@ -293,19 +293,27 @@ private:
         {
             Napi::Error::New(env,
                              "sharedBuffer is only available on segments created with "
-                             "SharedTensorSegment.createShared() or fromSharedBuffer(). "
-                             "mmap-backed segments cannot be shared across Worker threads "
-                             "because mmap(MAP_ANONYMOUS) is not inherited by Worker threads. "
-                             "Use createShared(maxBytes) to get a cross-thread segment.")
+                             "SharedTensorSegment.createShared() or fromSharedBuffer().")
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }
 
-        napi_value sab_val = nullptr;
-        napi_status status = napi_get_reference_value(env, sab_napi_ref_, &sab_val);
-        if (status != napi_ok || !sab_val)
+        // Retrieve the stored Uint8Array reference
+        napi_value u8a_val = nullptr;
+        napi_status status = napi_get_reference_value(env, sab_napi_ref_, &u8a_val);
+        if (status != napi_ok || !u8a_val)
         {
-            Napi::Error::New(env, "SharedArrayBuffer reference is no longer valid")
+            Napi::Error::New(env, "Stored TypedArray reference is no longer valid")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        // Extract the underlying SharedArrayBuffer from the TypedArray
+        napi_value sab_val = nullptr;
+        napi_get_typedarray_info(env, u8a_val, nullptr, nullptr, nullptr, &sab_val, nullptr);
+        if (!sab_val)
+        {
+            Napi::Error::New(env, "Could not retrieve SharedArrayBuffer from stored TypedArray")
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }

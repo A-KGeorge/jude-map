@@ -67,8 +67,8 @@ if (!isMainThread) {
       parentPort!.postMessage({ error: `unknown command: ${command}` });
   }
 
-  seg.destroy();
-  process.exit(0);
+  //   seg.destroy();
+  //   process.exit(0);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
