@@ -42,6 +42,30 @@
 #include "platform_mmap.h"
 #include "segment.h"
 
+// ─── Debug logging ────────────────────────────────────────────────────────────
+// Set JUDE_DEBUG=1 to enable. Zero cost when disabled.
+static bool jude_debug_enabled() noexcept
+{
+    static int cached = -1;
+    if (cached == -1)
+    {
+        const char *v = std::getenv("JUDE_DEBUG");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached == 1;
+}
+#define JUDE_LOG(...)                                       \
+    do                                                      \
+    {                                                       \
+        if (jude_debug_enabled())                           \
+        {                                                   \
+            fprintf(stderr, "[jude-map C++] " __VA_ARGS__); \
+            fprintf(stderr, "\n");                          \
+            fflush(stderr);                                 \
+        }                                                   \
+    } while (0)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
  * Optimized string-to-enum conversion.
  * Instead of multiple strcmp calls, we treat the first 8 bytes of the string
@@ -138,8 +162,10 @@ public:
                 bool init_header = (info.Length() >= 2 && info[1].IsBoolean())
                                        ? info[1].As<Napi::Boolean>().Value()
                                        : false;
-
                 auto u8a = info[0].As<Napi::Uint8Array>();
+                JUDE_LOG("ctor SAB path: u8a.Data()=%p byteLen=%zu initHeader=%d",
+                         static_cast<void *>(u8a.Data()), u8a.ByteLength(),
+                         (int)init_header);
                 void *sab_data = u8a.Data();
                 size_t sab_bytes = u8a.ByteLength();
 
@@ -159,14 +185,18 @@ public:
                 max_bytes_ = sab_bytes - DATA_OFFSET;
                 is_sab_backed_ = true;
 
+                JUDE_LOG("ctor SAB: mapped_=%p max_bytes_=%zu", mapped_, max_bytes_);
+
                 // Constructor — reference the TypedArray, not its .ArrayBuffer()
                 napi_create_reference(env, info[0], 1, &sab_napi_ref_);
+                JUDE_LOG("ctor SAB: napi_ref created=%p", (void *)sab_napi_ref_);
 
                 if (init_header)
                 {
                     // Placement-new initialises the Seqlock counter to 0 and
                     // zeroes TensorMeta. Only the creator (createShared) does this.
                     new (mapped_) SegmentHeader();
+                    JUDE_LOG("ctor SAB: SegmentHeader placement-newed at %p", mapped_);
                 }
                 // fromSharedBuffer: header is already live — do NOT reinitialise.
 
@@ -213,6 +243,8 @@ public:
         mapped_size_ = ((mapped_size_ + page_size - 1) / page_size) * page_size;
 
         mapped_ = platform_mmap(mapped_size_);
+        JUDE_LOG("ctor mmap: mapped_=%p mapped_size_=%zu", mapped_, mapped_size_);
+
         if (!mapped_)
         {
             Napi::Error::New(env, "mmap failed").ThrowAsJavaScriptException();
@@ -235,6 +267,8 @@ public:
 
     ~SharedTensor()
     {
+        JUDE_LOG("~SharedTensor: this=%p env_closing_=%d is_sab_backed_=%d mapped_=%p",
+                 (void *)this, (int)env_closing_, (int)is_sab_backed_, mapped_);
         if (cleanup_hook_registered_ && !env_closing_)
         {
             napi_remove_env_cleanup_hook(env_, &SharedTensor::OnEnvCleanup, this);
@@ -297,10 +331,15 @@ private:
                 .ThrowAsJavaScriptException();
             return env.Undefined();
         }
+        JUDE_LOG("GetSharedBuffer: this=%p sab_napi_ref_=%p", (void *)this, (void *)sab_napi_ref_);
 
         // Retrieve the stored Uint8Array reference
         napi_value u8a_val = nullptr;
         napi_status status = napi_get_reference_value(env, sab_napi_ref_, &u8a_val);
+
+        JUDE_LOG("GetSharedBuffer: napi_get_reference_value status=%d u8a_val=%p",
+                 (int)status, (void *)u8a_val);
+
         if (status != napi_ok || !u8a_val)
         {
             Napi::Error::New(env, "Stored TypedArray reference is no longer valid")
@@ -311,6 +350,7 @@ private:
         // Extract the underlying SharedArrayBuffer from the TypedArray
         napi_value sab_val = nullptr;
         napi_get_typedarray_info(env, u8a_val, nullptr, nullptr, nullptr, &sab_val, nullptr);
+        JUDE_LOG("GetSharedBuffer: napi_get_typedarray_info sab_val=%p", (void *)sab_val);
         if (!sab_val)
         {
             Napi::Error::New(env, "Could not retrieve SharedArrayBuffer from stored TypedArray")
@@ -539,6 +579,9 @@ private:
     static void OnEnvCleanup(void *data)
     {
         auto *self = static_cast<SharedTensor *>(data);
+        JUDE_LOG("OnEnvCleanup: self=%p sab_napi_ref_=%p mapped_=%p",
+                 (void *)self, (void *)self->sab_napi_ref_, self->mapped_);
+
         if (!self)
             return;
 
@@ -677,6 +720,9 @@ private:
 
     Napi::Value make_result(Napi::Env env, const TensorMeta &meta, uint64_t seq, bool copy)
     {
+        JUDE_LOG("make_result: this=%p mapped_=%p byte_length=%llu copy=%d sab=%d",
+                 (void *)this, mapped_, (unsigned long long)meta.byte_length,
+                 (int)copy, (int)is_sab_backed_);
         Napi::Object result = Napi::Object::New(env);
         Napi::Array shape_arr = Napi::Array::New(env, meta.ndim);
         for (uint32_t i = 0; i < meta.ndim; ++i)
@@ -689,26 +735,20 @@ private:
         result.Set("version", Napi::Number::New(env, static_cast<double>(seq)));
 
         uint8_t *data = segment_data_ptr(mapped_);
-        if (copy)
-        {
-            result.Set("buffer", Napi::Buffer<uint8_t>::Copy(env, data, meta.byte_length));
-        }
-        else
-        {
-            result.Set(
-                "buffer",
-                Napi::ArrayBuffer::New(env, data, meta.byte_length,
-                                       [](Napi::Env, void *)
-                                       {
-                                           // Lifetime is owned by SharedTensor's mmap/unmap.
-                                       }));
-        }
+        bool actual_copy = copy || is_sab_backed_;
 
+        if (actual_copy)
+            result.Set("buffer", Napi::Buffer<uint8_t>::Copy(env, data, meta.byte_length));
+        else
+            result.Set("buffer",
+                       Napi::ArrayBuffer::New(env, data, meta.byte_length,
+                                              [](Napi::Env, void *) {}));
         return result;
     }
 
     Napi::Value try_read(Napi::Env env, bool copy, uint32_t spin_limit, ReadStatus &status)
     {
+        JUDE_LOG("try_read: this=%p mapped_=%p", (void *)this, mapped_);
         if (!mapped_)
         {
             status = ReadStatus::Destroyed;
@@ -726,7 +766,7 @@ private:
             if (seq0 & 1u)
                 continue;
 
-            meta = hdr->meta;
+            std::memcpy(&meta, &hdr->meta, sizeof(TensorMeta));
             std::atomic_thread_fence(std::memory_order_acquire);
 
             const uint64_t seq1 = hdr->seqlock.sequence.load(std::memory_order_relaxed);
@@ -840,6 +880,8 @@ private:
         // (it would zero-init the Seqlock, which is wrong for a live segment
         // shared with other workers), and we must NOT call platform_munmap.
         // Just null mapped_ and release the persistent SAB reference.
+        JUDE_LOG("teardown_mapping SAB: this=%p env_closing_=%d sab_napi_ref_=%p",
+                 (void *)this, (int)env_closing_, (void *)sab_napi_ref_);
         if (is_sab_backed_)
         {
             mapped_ = nullptr;
@@ -860,6 +902,9 @@ private:
         // ── mmap path ───────────────────────────────────────────────────────
         addr = mapped_;
         size = mapped_size_;
+
+        JUDE_LOG("teardown_mapping mmap: this=%p mapped_=%p size=%zu",
+                 (void *)this, addr, size);
 
         if (pinned_)
         {

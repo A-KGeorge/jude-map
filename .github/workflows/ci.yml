@@ -133,10 +133,6 @@ jobs:
   install-libtensorflow:
     name: "libtensorflow / ${{ matrix.os }}"
     needs: changes
-    if: |
-      needs.changes.outputs.jude-tf == 'true' ||
-      needs.changes.outputs.ci == 'true' ||
-      github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -182,10 +178,6 @@ jobs:
   test-jude-tf:
     name: "jude-tf / ${{ matrix.os }} / Node ${{ matrix.node }}"
     needs: [changes, install-libtensorflow]
-    if: |
-      needs.changes.outputs.jude-tf == 'true' ||
-      needs.changes.outputs.ci == 'true' ||
-      github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     defaults:
