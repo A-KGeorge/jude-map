@@ -151,8 +151,14 @@ public:
         // We hold a napi_ref to prevent V8 GC from collecting the SAB while
         // this wrapper is still alive.
         {
+            // Detect SAB-backed path via Uint8Array view over a SharedArrayBuffer.
+            // napi_is_shared_arraybuffer / napi_get_shared_arraybuffer_info are
+            // not available at NAPI_VERSION=8. Instead, the TS wrapper passes
+            // new Uint8Array(sab) so we detect via IsTypedArray + napi_uint8_array.
             bool input_is_sab = false;
-            if (info.Length() >= 1 && info[0].IsTypedArray() && info[0].As<Napi::TypedArray>().TypedArrayType() == napi_uint8_array)
+            if (info.Length() >= 1 &&
+                info[0].IsTypedArray() &&
+                info[0].As<Napi::TypedArray>().TypedArrayType() == napi_uint8_array)
             {
                 input_is_sab = true;
             }
@@ -185,9 +191,9 @@ public:
                 max_bytes_ = sab_bytes - DATA_OFFSET;
                 is_sab_backed_ = true;
 
-                JUDE_LOG("ctor SAB: mapped_=%p max_bytes_=%zu", mapped_, max_bytes_);
-
-                // Constructor — reference the TypedArray, not its .ArrayBuffer()
+                // Reference the Uint8Array (not its .ArrayBuffer()) to keep the
+                // SAB alive. napi_get_typedarray_info is used in GetSharedBuffer
+                // to retrieve the underlying SAB from this stored reference.
                 napi_create_reference(env, info[0], 1, &sab_napi_ref_);
                 JUDE_LOG("ctor SAB: napi_ref created=%p", (void *)sab_napi_ref_);
 
