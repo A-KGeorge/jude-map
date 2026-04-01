@@ -103,6 +103,7 @@ public:
                                                                    InstanceMethod<&SharedTensor::Unpin>("unpin"),
                                                                    InstanceAccessor<&SharedTensor::ByteCapacity>("byteCapacity"),
                                                                    InstanceAccessor<&SharedTensor::IsPinned>("isPinned"),
+                                                                   InstanceAccessor<&SharedTensor::GetSharedBuffer>("sharedBuffer"),
                                                                });
 
         auto *ctor = new Napi::FunctionReference(Napi::Persistent(func));
@@ -116,14 +117,87 @@ public:
         Napi::Env env = info.Env();
         env_ = env;
 
+        // ── SAB-backed construction path ───────────────────────────────────
+        // new SharedTensor(sab: SharedArrayBuffer, initHeader: boolean)
+        //
+        // initHeader=true  → createShared():      placement-new SegmentHeader
+        // initHeader=false → fromSharedBuffer():  header already live, skip
+        //
+        // The SAB owns the physical memory — never call platform_munmap on it.
+        // We hold a napi_ref to prevent V8 GC from collecting the SAB while
+        // this wrapper is still alive.
+        {
+            bool input_is_sab = false;
+            if (info.Length() >= 1 && info[0].IsTypedArray() && info[0].As<Napi::TypedArray>().TypedArrayType() == napi_uint8_array)
+            {
+                input_is_sab = true;
+            }
+
+            if (input_is_sab)
+            {
+                bool init_header = (info.Length() >= 2 && info[1].IsBoolean())
+                                       ? info[1].As<Napi::Boolean>().Value()
+                                       : false;
+
+                auto u8a = info[0].As<Napi::Uint8Array>();
+                void *sab_data = u8a.Data();
+                size_t sab_bytes = u8a.ByteLength();
+
+                if (!sab_data || sab_bytes < DATA_OFFSET)
+                {
+                    Napi::RangeError::New(env,
+                                          "SharedArrayBuffer must be at least " +
+                                              std::to_string(DATA_OFFSET) +
+                                              " bytes (SegmentHeader size = " +
+                                              std::to_string(DATA_OFFSET) + ")")
+                        .ThrowAsJavaScriptException();
+                    return;
+                }
+
+                mapped_ = sab_data;
+                mapped_size_ = sab_bytes;
+                max_bytes_ = sab_bytes - DATA_OFFSET;
+                is_sab_backed_ = true;
+
+                // Persist the underlying SAB so V8 doesn't GC it while we hold mapped_.
+                napi_create_reference(env, u8a.ArrayBuffer(), 1, &sab_napi_ref_);
+
+                if (init_header)
+                {
+                    // Placement-new initialises the Seqlock counter to 0 and
+                    // zeroes TensorMeta. Only the creator (createShared) does this.
+                    new (mapped_) SegmentHeader();
+                }
+                // fromSharedBuffer: header is already live — do NOT reinitialise.
+
+                if (!init_uv_async(env))
+                {
+                    napi_delete_reference(env, sab_napi_ref_);
+                    sab_napi_ref_ = nullptr;
+                    mapped_ = nullptr;
+                    is_sab_backed_ = false;
+                    return; // error already thrown by init_uv_async
+                }
+
+                napi_add_env_cleanup_hook(env, &SharedTensor::OnEnvCleanup, this);
+                cleanup_hook_registered_ = true;
+                return; // SAB path complete
+            }
+        }
+
+        // ── mmap-backed construction path (unchanged) ──────────────────────
+        // new SharedTensor(maxBytes: number)
         if (info.Length() < 1 || !info[0].IsNumber())
         {
-            Napi::TypeError::New(env, "SharedTensor(maxBytes: number)").ThrowAsJavaScriptException();
+            Napi::TypeError::New(env,
+                                 "SharedTensor(maxBytes: number) or "
+                                 "SharedTensor(sab: SharedArrayBuffer, initHeader: boolean)")
+                .ThrowAsJavaScriptException();
             return;
         }
 
         size_t max_bytes = static_cast<size_t>(info[0].As<Napi::Number>().DoubleValue());
-        max_bytes_ = max_bytes; // store before page-rounding
+        max_bytes_ = max_bytes;
         mapped_size_ = DATA_OFFSET + max_bytes;
 
         // Round up to page boundary
@@ -139,7 +213,7 @@ public:
         mapped_size_ = ((mapped_size_ + page_size - 1) / page_size) * page_size;
 
         mapped_ = platform_mmap(mapped_size_);
-        if (mapped_ == nullptr)
+        if (!mapped_)
         {
             Napi::Error::New(env, "mmap failed").ThrowAsJavaScriptException();
             return;
@@ -148,33 +222,12 @@ public:
         // Placement-new the header to initialize atomics/seqlock
         new (mapped_) SegmentHeader();
 
-        uv_loop_t *loop = nullptr;
-        if (napi_get_uv_event_loop(env, &loop) != napi_ok || loop == nullptr)
+        if (!init_uv_async(env))
         {
-            unmap(false);
-            Napi::Error::New(env, "Failed to get uv event loop").ThrowAsJavaScriptException();
-            return;
+            platform_munmap(mapped_, mapped_size_);
+            mapped_ = nullptr;
+            return; // error already thrown
         }
-
-        read_async_ = new uv_async_t{};
-        if (uv_async_init(loop, read_async_, &SharedTensor::OnReadAsyncWake) != 0)
-        {
-            delete read_async_;
-            read_async_ = nullptr;
-            unmap(false);
-            Napi::Error::New(env, "Failed to initialize uv_async handle").ThrowAsJavaScriptException();
-            return;
-        }
-
-        read_async_->data = this;
-
-        uv_unref(reinterpret_cast<uv_handle_t *>(read_async_));
-        // uv_unref marks this handle as weak — it won't prevent the event loop
-        // from exiting when all other work is done. Without this, any surviving
-        // SharedTensor instance (e.g. GC'd after loop teardown) causes the
-        // uv__finish_close assertion on macOS and Linux.
-
-        read_async_initialized_ = true;
 
         napi_add_env_cleanup_hook(env, &SharedTensor::OnEnvCleanup, this);
         cleanup_hook_registered_ = true;
@@ -198,6 +251,67 @@ private:
         RetryNeeded,
         Destroyed,
     };
+
+    // ── uv_async initialisation (shared between both constructor paths) ─────
+    bool init_uv_async(Napi::Env env)
+    {
+        uv_loop_t *loop = nullptr;
+        if (napi_get_uv_event_loop(env, &loop) != napi_ok || !loop)
+        {
+            Napi::Error::New(env, "Failed to get uv event loop")
+                .ThrowAsJavaScriptException();
+            return false;
+        }
+
+        read_async_ = new uv_async_t{};
+        if (uv_async_init(loop, read_async_, &SharedTensor::OnReadAsyncWake) != 0)
+        {
+            delete read_async_;
+            read_async_ = nullptr;
+            Napi::Error::New(env, "Failed to initialize uv_async handle")
+                .ThrowAsJavaScriptException();
+            return false;
+        }
+
+        read_async_->data = this;
+        // Mark as weak — won't prevent the event loop from exiting when all
+        // other work is done (avoids uv__finish_close assertions on teardown).
+        uv_unref(reinterpret_cast<uv_handle_t *>(read_async_));
+        read_async_initialized_ = true;
+        return true;
+    }
+
+    // ── GetSharedBuffer ────────────────────────────────────────────────────
+    // Returns the SharedArrayBuffer that backs this segment.
+    // Throws if called on an mmap-backed segment — those can't be transferred
+    // across Worker threads (mmap is process-local on all platforms).
+    Napi::Value GetSharedBuffer(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+
+        if (!is_sab_backed_ || !sab_napi_ref_)
+        {
+            Napi::Error::New(env,
+                             "sharedBuffer is only available on segments created with "
+                             "SharedTensorSegment.createShared() or fromSharedBuffer(). "
+                             "mmap-backed segments cannot be shared across Worker threads "
+                             "because mmap(MAP_ANONYMOUS) is not inherited by Worker threads. "
+                             "Use createShared(maxBytes) to get a cross-thread segment.")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        napi_value sab_val = nullptr;
+        napi_status status = napi_get_reference_value(env, sab_napi_ref_, &sab_val);
+        if (status != napi_ok || !sab_val)
+        {
+            Napi::Error::New(env, "SharedArrayBuffer reference is no longer valid")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+
+        return Napi::Value(env, sab_val);
+    }
 
     static void parallel_write(void *dest, const void *src, size_t size) noexcept
     {
@@ -381,6 +495,8 @@ private:
 
     static constexpr uint32_t READ_SPIN_LIMIT = 16;
 
+    // ── Fields ────────────────────────────────────────────────────────────────
+
     Napi::Env env_ = nullptr;
     void *mapped_ = nullptr;
     size_t mapped_size_ = 0;
@@ -391,6 +507,16 @@ private:
     bool read_async_closing_ = false;
     bool env_closing_ = false;
     bool cleanup_hook_registered_ = false;
+
+    // ── SAB transport fields ─────────────────────────────────────────────────
+    // Set when the segment is created via the SAB constructor path.
+    // is_sab_backed_: when true, teardown_mapping skips ~SegmentHeader and
+    //                 platform_munmap because V8/SAB owns the memory.
+    // sab_napi_ref_:  persistent reference that keeps the SAB alive for the
+    //                 lifetime of this wrapper. Released in teardown_mapping
+    //                 (normal destroy) or OnEnvCleanup (env teardown).
+    bool is_sab_backed_ = false;
+    napi_ref sab_napi_ref_ = nullptr;
     std::mutex pending_reads_mu_;
     std::deque<std::shared_ptr<PendingRead>> pending_reads_;
     std::mutex fill_queue_mu_;
@@ -412,6 +538,15 @@ private:
         self->cleanup_hook_registered_ = false;
         self->clear_pending_reads();
         self->close_async_handle();
+
+        // Release the SAB reference while env_ is still valid.
+        // If we defer this to teardown_mapping/unmap (called from ~SharedTensor
+        // after env teardown), napi_delete_reference would operate on a dead env.
+        if (self->sab_napi_ref_)
+        {
+            napi_delete_reference(self->env_, self->sab_napi_ref_);
+            self->sab_napi_ref_ = nullptr;
+        }
     }
 
     void close_async_handle()
@@ -669,6 +804,15 @@ private:
             uv_async_send(read_async_);
     }
 
+    // ── teardown_mapping ─────────────────────────────────────────────────────
+    // Splits destroy into two phases:
+    //   Phase 1 (this method — synchronous, event loop thread):
+    //     Reject pending reads, close uv_async, null mapped_.
+    //     For mmap: call SegmentHeader destructor, set addr/size for munmap.
+    //     For SAB:  skip destructor (Atomics don't need explicit teardown),
+    //               skip munmap (V8 owns the memory), release napi_ref.
+    //   Phase 2 (caller — sync or async):
+    //     platform_munmap if addr != nullptr (mmap path only).
     void teardown_mapping(bool reject_waiters, void *&addr, size_t &size)
     {
         if (reject_waiters && !env_closing_)
@@ -683,6 +827,29 @@ private:
         if (!mapped_)
             return;
 
+        // ── SAB path ────────────────────────────────────────────────────────
+        // V8 owns the SAB memory. We must NOT call the SegmentHeader destructor
+        // (it would zero-init the Seqlock, which is wrong for a live segment
+        // shared with other workers), and we must NOT call platform_munmap.
+        // Just null mapped_ and release the persistent SAB reference.
+        if (is_sab_backed_)
+        {
+            mapped_ = nullptr;
+            mapped_size_ = 0;
+            is_sab_backed_ = false;
+
+            // Release the napi_ref only if env is still valid.
+            // OnEnvCleanup already handles the env-teardown case.
+            if (sab_napi_ref_ && !env_closing_)
+            {
+                napi_delete_reference(env_, sab_napi_ref_);
+                sab_napi_ref_ = nullptr;
+            }
+            // addr stays nullptr → caller (unmap / DestroyAsync) won't munmap.
+            return;
+        }
+
+        // ── mmap path ───────────────────────────────────────────────────────
         addr = mapped_;
         size = mapped_size_;
 
@@ -794,23 +961,23 @@ private:
     Napi::Value DestroyAsync(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
-
         if (!mapped_)
         {
-            // Already destroyed — return a resolved Promise.
-            auto deferred = Napi::Promise::Deferred::New(env);
-            deferred.Resolve(env.Undefined());
-            return deferred.Promise();
+            auto d = Napi::Promise::Deferred::New(env);
+            d.Resolve(env.Undefined());
+            return d.Promise();
         }
 
         void *addr = nullptr;
         size_t size = 0;
         teardown_mapping(true, addr, size);
+
+        // SAB-backed: teardown already handled everything — nothing to munmap.
         if (!addr)
         {
-            auto deferred = Napi::Promise::Deferred::New(env);
-            deferred.Resolve(env.Undefined());
-            return deferred.Promise();
+            auto d = Napi::Promise::Deferred::New(env);
+            d.Resolve(env.Undefined());
+            return d.Promise();
         }
 
         // -- Phase 2: async munmap on thread pool --
@@ -818,43 +985,38 @@ private:
 
         uv_loop_t *loop = nullptr;
         napi_get_uv_event_loop(env, &loop);
-
-        if (!loop || uv_queue_work(loop, &ctx->req,
-                                   OnUnmapWork, OnUnmapAfter) != 0)
+        if (!loop || uv_queue_work(loop, &ctx->req, OnUnmapWork, OnUnmapAfter) != 0)
         {
             // Fallback: do it synchronously if queue fails.
             platform_munmap(addr, size);
             delete ctx;
         }
-        else
-        {
-            // Work accepted; callback owns ctx lifetime.
-        }
 
-        auto deferred = Napi::Promise::Deferred::New(env);
-        deferred.Resolve(env.Undefined());
-        return deferred.Promise();
+        auto d = Napi::Promise::Deferred::New(env);
+        d.Resolve(env.Undefined());
+        return d.Promise();
     }
 
     Napi::Value DestroyAsyncWait(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
-
         if (!mapped_)
         {
-            auto deferred = Napi::Promise::Deferred::New(env);
-            deferred.Resolve(env.Undefined());
-            return deferred.Promise();
+            auto d = Napi::Promise::Deferred::New(env);
+            d.Resolve(env.Undefined());
+            return d.Promise();
         }
 
         void *addr = nullptr;
         size_t size = 0;
         teardown_mapping(true, addr, size);
+
+        // SAB-backed: nothing to munmap asynchronously.
         if (!addr)
         {
-            auto deferred = Napi::Promise::Deferred::New(env);
-            deferred.Resolve(env.Undefined());
-            return deferred.Promise();
+            auto d = Napi::Promise::Deferred::New(env);
+            d.Resolve(env.Undefined());
+            return d.Promise();
         }
 
         auto *ctx = new UnmapCtx(env, addr, size, true);
@@ -862,9 +1024,7 @@ private:
 
         uv_loop_t *loop = nullptr;
         napi_get_uv_event_loop(env, &loop);
-
-        if (!loop || uv_queue_work(loop, &ctx->req,
-                                   OnUnmapWork, OnUnmapAfter) != 0)
+        if (!loop || uv_queue_work(loop, &ctx->req, OnUnmapWork, OnUnmapAfter) != 0)
         {
             platform_munmap(addr, size);
             ctx->self_ref.Unref();
