@@ -4,10 +4,10 @@
       "target_name": "test_ab",
       "sources": [ "test_ab.cc" ],
       "include_dirs": [
-        "<!@(node -p "require('node-addon-api').include")"
+        "<!@(node -p \"require('node-addon-api').include\")"
       ],
       "dependencies": [
-        "<!(node -p "require('node-addon-api').gyp")"
+        "<!(node -p \"require('node-addon-api').gyp\")"
       ],
       "cflags!": [ "-fno-exceptions" ],
       "cflags_cc!": [ "-fno-exceptions" ],
