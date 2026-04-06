@@ -7,6 +7,8 @@
         "src/native/seqlock.h",
         "src/native/segment.h",
         "src/native/platform_mmap.h",
+        "src/native/segment_rcu.h",
+        "src/native/segment_ring.h",
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")",        

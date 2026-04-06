@@ -41,6 +41,8 @@
 
 #include "platform_mmap.h"
 #include "segment.h"
+#include "segment_ring.h"
+#include "segment_rcu.h"
 
 // ─── Debug logging ────────────────────────────────────────────────────────────
 // Set JUDE_DEBUG=1 to enable. Zero cost when disabled.
@@ -108,7 +110,31 @@ static DType dtype_from_string(const char *s) noexcept
 
 class SharedTensor : public Napi::ObjectWrap<SharedTensor>
 {
+private:
+    enum class SegmentMode
+    {
+        SEQLOCK, // existing path: small tensors, seqlock + retry
+        RCU,     // new path: large tensors, double-buffer, O(1) read
+        RING,    // new path: streaming, lock-free ring buffer
+    };
+
 public:
+    Napi::Value GetMode(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        switch (segment_mode_)
+        {
+        case SegmentMode::SEQLOCK:
+            return Napi::String::New(env, "seqlock");
+        case SegmentMode::RCU:
+            return Napi::String::New(env, "rcu");
+        case SegmentMode::RING:
+            return Napi::String::New(env, "ring_buffer");
+        default:
+            return Napi::String::New(env, "unknown");
+        }
+    }
+
     static Napi::Object Init(Napi::Env env, Napi::Object exports)
     {
         Napi::Function func = DefineClass(env, "SharedTensor", {
@@ -128,6 +154,7 @@ public:
                                                                    InstanceAccessor<&SharedTensor::ByteCapacity>("byteCapacity"),
                                                                    InstanceAccessor<&SharedTensor::IsPinned>("isPinned"),
                                                                    InstanceAccessor<&SharedTensor::GetSharedBuffer>("sharedBuffer"),
+                                                                   InstanceAccessor<&SharedTensor::GetMode>("mode"),
                                                                });
 
         auto *ctor = new Napi::FunctionReference(Napi::Persistent(func));
@@ -197,12 +224,55 @@ public:
                 napi_create_reference(env, info[0], 1, &sab_napi_ref_);
                 JUDE_LOG("ctor SAB: napi_ref created=%p", (void *)sab_napi_ref_);
 
+                // Detect segment mode from optional third argument.
+                SegmentMode mode = SegmentMode::SEQLOCK; // default
+                uint32_t ring_cap = 0;
+                if (info.Length() >= 3)
+                {
+                    if (info[2].IsString())
+                    {
+                        std::string mode_str = info[2].As<Napi::String>().Utf8Value();
+                        if (mode_str == "rcu")
+                            mode = SegmentMode::RCU;
+                        else if (mode_str == "ring")
+                        {
+                            // ring requires a 4th arg: capacity (u32, power of 2)
+                            if (info.Length() >= 4 && info[3].IsNumber())
+                            {
+                                ring_cap = info[3].As<Napi::Number>().Uint32Value();
+                                mode = SegmentMode::RING;
+                            }
+                        }
+                    }
+                }
+                segment_mode_ = mode;
+                ring_capacity_ = ring_cap;
+
                 if (init_header)
                 {
-                    // Placement-new initialises the Seqlock counter to 0 and
-                    // zeroes TensorMeta. Only the creator (createShared) does this.
-                    new (mapped_) SegmentHeader();
-                    JUDE_LOG("ctor SAB: SegmentHeader placement-newed at %p", mapped_);
+                    switch (mode)
+                    {
+                    case SegmentMode::SEQLOCK:
+                        new (mapped_) SegmentHeader();
+                        JUDE_LOG("ctor SAB: SegmentHeader placement-newed at %p", mapped_);
+                        break;
+                    case SegmentMode::RCU:
+                        rcu_init_header(mapped_);
+                        break;
+                    case SegmentMode::RING:
+                    {
+                        uint32_t mbs = (mapped_size_ - sizeof(RingHeader) - ring_cap * sizeof(RingSlot)) / ring_cap;
+                        max_bytes_ = mbs;
+                        if (!ring_init(mapped_, ring_cap, mbs))
+                        {
+                            Napi::RangeError::New(env,
+                                                  "ring capacity must be a power of 2 and > 0")
+                                .ThrowAsJavaScriptException();
+                            return;
+                        }
+                        break;
+                    }
+                    }
                 }
                 // fromSharedBuffer: header is already live — do NOT reinitialise.
 
@@ -576,6 +646,8 @@ private:
     std::mutex fill_queue_mu_;
     std::deque<FillWorkCtx *> pending_fills_;
     bool fill_inflight_ = false;
+    SegmentMode segment_mode_ = SegmentMode::SEQLOCK;
+    uint32_t ring_capacity_ = 0; // RING mode only: number of slots
 
     static void OnAsyncClose(uv_handle_t *handle)
     {
@@ -724,6 +796,24 @@ private:
             uv_async_send(read_async_);
     }
 
+    Napi::Value make_result_buffer_copy(Napi::Env env, const TensorMeta &meta, const uint8_t *ptr_data, size_t byte_length)
+    {
+        Napi::Object result = Napi::Object::New(env);
+        Napi::Array shape_arr = Napi::Array::New(env, meta.ndim);
+        for (uint32_t i = 0; i < meta.ndim; ++i)
+        {
+            shape_arr.Set(i, Napi::Number::New(env, static_cast<double>(meta.shape[i])));
+        }
+
+        result.Set("shape", shape_arr);
+        result.Set("dtype", static_cast<uint32_t>(meta.dtype));
+        result.Set("version", Napi::Number::New(env, 0)); // RCU sequence or default
+
+        result.Set("buffer", Napi::Buffer<uint8_t>::Copy(env, ptr_data, byte_length));
+
+        return result;
+    }
+
     Napi::Value make_result(Napi::Env env, const TensorMeta &meta, uint64_t seq, bool copy)
     {
         JUDE_LOG("make_result: this=%p mapped_=%p byte_length=%llu copy=%d sab=%d",
@@ -766,38 +856,98 @@ private:
         uint64_t stable_seq = 0;
         bool got_snapshot = false;
 
-        for (uint32_t attempt = 0; attempt < spin_limit; ++attempt)
+        switch (segment_mode_)
         {
-            const uint64_t seq0 = hdr->seqlock.sequence.load(std::memory_order_acquire);
-            if (seq0 & 1u)
-                continue;
+        case SegmentMode::SEQLOCK:
+        {
+            for (uint32_t attempt = 0; attempt < spin_limit; ++attempt)
+            {
+                const uint64_t seq0 = hdr->seqlock.sequence.load(std::memory_order_acquire);
+                if (seq0 & 1u)
+                    continue;
+                std::memcpy(&meta, &hdr->meta, sizeof(TensorMeta));
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const uint64_t seq1 = hdr->seqlock.sequence.load(std::memory_order_relaxed);
+                if (seq0 != seq1)
+                    continue;
+                stable_seq = seq0;
+                got_snapshot = true;
+                break;
+            }
 
-            std::memcpy(&meta, &hdr->meta, sizeof(TensorMeta));
-            std::atomic_thread_fence(std::memory_order_acquire);
-
-            const uint64_t seq1 = hdr->seqlock.sequence.load(std::memory_order_relaxed);
-            if (seq0 != seq1)
-                continue;
-
-            stable_seq = seq0;
-            got_snapshot = true;
-            break;
+            if (!got_snapshot)
+            {
+                status = ReadStatus::RetryNeeded;
+                return env.Null();
+            }
+            if (meta.byte_length == 0)
+            {
+                status = ReadStatus::Empty;
+                return env.Null();
+            }
+            status = ReadStatus::Ok;
+            return make_result(env, meta, stable_seq, copy);
         }
 
-        if (!got_snapshot)
+        case SegmentMode::RCU:
         {
-            status = ReadStatus::RetryNeeded;
-            return env.Null();
+            // O(1) read — no seqlock retry, no spin on data consistency.
+            RCUReadGuard guard(mapped_); // pins current buffer, at most 1 retry
+            const TensorMeta &meta = guard.meta();
+            if (meta.byte_length == 0)
+            {
+                status = ReadStatus::Empty;
+                return env.Null();
+            }
+            // Build result from pinned buffer.
+            Napi::Object result = Napi::Object::New(env);
+            Napi::Array shape_arr = Napi::Array::New(env, meta.ndim);
+            for (uint32_t i = 0; i < meta.ndim; ++i)
+                shape_arr.Set(i, Napi::Number::New(env, static_cast<double>(meta.shape[i])));
+            result.Set("shape", shape_arr);
+            result.Set("dtype", static_cast<uint32_t>(meta.dtype));
+            result.Set("version", Napi::Number::New(env, 0.0)); // RCU has no version counter
+            const uint8_t *src = guard.data_ptr(mapped_, max_bytes_);
+            // Always copy from RCU buffer — zero-copy would require keeping the
+            // guard alive beyond this function, which isn't safe from JS.
+            result.Set("buffer",
+                       Napi::Buffer<uint8_t>::Copy(env, src, meta.byte_length));
+            status = ReadStatus::Ok;
+            return result;
+            // guard destructor releases the reader pin here.
         }
 
-        if (meta.byte_length == 0)
+        case SegmentMode::RING:
         {
-            status = ReadStatus::Empty;
-            return env.Null();
+            TensorMeta meta{};
+            uint32_t slot_idx = 0;
+            bool ok = ring_pop(mapped_, meta, nullptr, false, &slot_idx, nullptr);
+            if (!ok)
+            {
+                status = ReadStatus::Empty;
+                return env.Null();
+            }
+            uint8_t *src = ring_slot_data(mapped_, slot_idx,
+                                          ring_header(mapped_)->max_bytes_per_slot);
+            Napi::Object result = Napi::Object::New(env);
+            Napi::Array shape_arr = Napi::Array::New(env, meta.ndim);
+            for (uint32_t i = 0; i < meta.ndim; ++i)
+                shape_arr.Set(i, Napi::Number::New(env, static_cast<double>(meta.shape[i])));
+            result.Set("shape", shape_arr);
+            result.Set("dtype", static_cast<uint32_t>(meta.dtype));
+            result.Set("version", Napi::Number::New(env, 0.0));
+            // Copy out of ring slot then release — zero-copy would require the slot
+            // to stay READING until JS is done with it, which is hard to track.
+            result.Set("buffer",
+                       Napi::Buffer<uint8_t>::Copy(env, src, meta.byte_length));
+            ring_pop_release(mapped_, slot_idx);
+            status = ReadStatus::Ok;
+            return result;
         }
-
-        status = ReadStatus::Ok;
-        return make_result(env, meta, stable_seq, copy);
+        }
+        // unreachable
+        status = ReadStatus::Empty;
+        return env.Null();
     }
 
     void flush_pending_reads()
@@ -1864,28 +2014,72 @@ private:
         }
 
         const size_t capacity = max_bytes_;
-        if (src_size > capacity)
+        const size_t req_bytes = capacity; // We map max_bytes_ directly
+        if (src_size > req_bytes)
         {
             Napi::RangeError::New(env, "tensor byte size exceeds segment capacity").ThrowAsJavaScriptException();
             return env.Undefined();
         }
 
-        // 3. Metadata commit with Seqlock
         auto *hdr = reinterpret_cast<SegmentHeader *>(mapped_);
-        hdr->seqlock.write_begin(); // Corrected member name
-
-        hdr->meta.ndim = ndim;
-        hdr->meta.dtype = dtype;
-        hdr->meta.byte_length = src_size;
+        uint64_t shape_arr_copy[MAX_DIMS];
         for (uint32_t i = 0; i < ndim; ++i)
         {
-            hdr->meta.shape[i] = shape_arr.Get(i).As<Napi::Number>().Uint32Value();
+            shape_arr_copy[i] = static_cast<uint64_t>(shape_arr.Get(i).As<Napi::Number>().DoubleValue());
         }
-        std::memcpy(segment_data_ptr(mapped_), src_ptr, src_size);
 
-        hdr->seqlock.write_end();
+        switch (segment_mode_)
+        {
+        case SegmentMode::SEQLOCK:
+        {
+            hdr->seqlock.write_begin();
+            hdr->meta.ndim = ndim;
+            hdr->meta.dtype = dtype;
+            hdr->meta.byte_length = src_size;
+            std::memcpy(hdr->meta.shape, shape_arr_copy, sizeof(uint64_t) * ndim);
+            std::memcpy(segment_data_ptr(mapped_), src_ptr, src_size);
+            hdr->seqlock.write_end();
+            signal_pending_reads();
+            break;
+        }
+        case SegmentMode::RCU:
+        {
+            TensorMeta tm;
+            tm.ndim = ndim;
+            tm.dtype = dtype;
+            tm.byte_length = src_size;
+            std::memcpy(tm.shape, shape_arr_copy, sizeof(uint64_t) * ndim);
+
+            rcu_write(mapped_, max_bytes_, src_ptr, src_size, tm);
+            signal_pending_reads();
+            break;
+        }
+        case SegmentMode::RING:
+        {
+            TensorMeta tm;
+            tm.ndim = ndim;
+            tm.dtype = dtype;
+            tm.byte_length = src_size;
+            std::memcpy(tm.shape, shape_arr_copy, sizeof(uint64_t) * ndim);
+
+            if (!ring_push(mapped_, src_ptr, src_size, tm))
+            {
+                // Ring buffer full
+                Napi::RangeError::New(env,
+                                      "ring buffer full — apply backpressure or increase capacity")
+                    .ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+            else
+            {
+                signal_pending_reads();
+            }
+            break;
+        }
+        }
+
         signal_pending_reads();
-        return env.Undefined();
+        return Napi::Boolean::New(env, true);
     }
 
     Napi::Value WriteAsync(const Napi::CallbackInfo &info)

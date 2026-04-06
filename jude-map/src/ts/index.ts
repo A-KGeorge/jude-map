@@ -17,9 +17,6 @@ const __dirname = dirname(__filename);
 //     initHeader=true  → createShared():      placement-new SegmentHeader
 //     initHeader=false → fromSharedBuffer():  header already live, skip
 //
-type NativeSharedTensorCtor =
-  | { new (maxBytes: number): any }
-  | { new (sab: SharedArrayBuffer, initHeader: boolean): any };
 
 let NativeSharedTensor: any;
 try {
@@ -57,6 +54,8 @@ if (typeof NativeSharedTensor !== "function")
 // Seqlock(64) + TensorMeta(128) + gpu_pad(64) = 256 bytes.
 // A SharedArrayBuffer for a shared segment must be DATA_OFFSET + maxBytes.
 export const DATA_OFFSET = 256;
+export const RCU_HEADER_SIZE = 384; // RCU header size
+export const RCU_THRESHOLD = 64 * 1024; // 64 KB — prefer RCU above this
 
 // ── DType ────────────────────────────────────────────────────────────────────
 
@@ -134,6 +133,8 @@ function wrap(result: any): TensorResult | null {
   };
 }
 
+export type SegmentMode = "seqlock" | "rcu" | "ring";
+
 export class SharedTensorSegment {
   /** @internal */ _native: any;
 
@@ -143,6 +144,7 @@ export class SharedTensorSegment {
   // on some platforms (Windows), which then fails instanceof SharedArrayBuffer
   // when passed through workerData structured-clone.
   private _sab?: SharedArrayBuffer;
+  private _mode: SegmentMode = "seqlock";
 
   // ── Constructors (private) ─────────────────────────────────────────────────
   // Public entry points: new SharedTensorSegment(maxBytes) for mmap segments,
@@ -156,14 +158,34 @@ export class SharedTensorSegment {
   private static _fromSAB(
     sab: SharedArrayBuffer,
     initHeader: boolean,
+    mode: SegmentMode,
+    ringCap?: number,
   ): SharedTensorSegment {
     const seg = Object.create(
       SharedTensorSegment.prototype,
     ) as SharedTensorSegment;
-    // Pass Uint8Array view — native constructor detects IsTypedArray(), not SAB directly.
-    seg._native = new NativeSharedTensor(new Uint8Array(sab), initHeader);
-    // Cache the SAB so sharedBuffer never needs the C++ getter.
+    switch (mode) {
+      case "seqlock":
+        seg._native = new NativeSharedTensor(new Uint8Array(sab), initHeader);
+        break;
+      case "rcu":
+        seg._native = new NativeSharedTensor(
+          new Uint8Array(sab),
+          initHeader,
+          "rcu",
+        );
+        break;
+      case "ring":
+        seg._native = new NativeSharedTensor(
+          new Uint8Array(sab),
+          initHeader,
+          "ring",
+          ringCap!,
+        );
+        break;
+    }
     seg._sab = sab;
+    seg._mode = mode;
     return seg;
   }
 
@@ -193,7 +215,30 @@ export class SharedTensorSegment {
   static createShared(maxBytes: number): SharedTensorSegment {
     if (maxBytes <= 0) throw new RangeError("maxBytes must be > 0");
     const sab = new SharedArrayBuffer(DATA_OFFSET + maxBytes);
-    return SharedTensorSegment._fromSAB(sab, /* initHeader */ true);
+    return SharedTensorSegment._fromSAB(sab, true, "seqlock");
+  }
+
+  // ── RCU factory (large tensors >= 64KB, stable p99) ──────────────────────
+  static createSharedRCU(maxBytes: number): SharedTensorSegment {
+    if (maxBytes <= 0) throw new RangeError("maxBytes must be > 0");
+    const sab = new SharedArrayBuffer(RCU_HEADER_SIZE + 2 * maxBytes);
+    return SharedTensorSegment._fromSAB(sab, true, "rcu");
+  }
+
+  // ── Ring buffer factory (streaming pipelines) ────────────────────────────
+  static createRing(
+    capacity: number,
+    maxBytesPerSlot: number,
+  ): SharedTensorSegment {
+    if (capacity <= 0 || (capacity & (capacity - 1)) !== 0)
+      throw new RangeError("capacity must be a power of 2 and > 0");
+    if (maxBytesPerSlot <= 0)
+      throw new RangeError("maxBytesPerSlot must be > 0");
+    // sizeof(RingSlot) = 64 + sizeof(TensorMeta) = 64 + 128 = 192, round to 256
+    const RING_SLOT_SIZE = 256;
+    const sabSize = 128 + capacity * (RING_SLOT_SIZE + maxBytesPerSlot);
+    const sab = new SharedArrayBuffer(sabSize);
+    return SharedTensorSegment._fromSAB(sab, true, "ring", capacity);
   }
 
   /**
@@ -212,6 +257,8 @@ export class SharedTensorSegment {
   static fromSharedBuffer(
     sab: SharedArrayBuffer,
     maxBytes: number,
+    mode: SegmentMode = "seqlock",
+    ringCap?: number,
   ): SharedTensorSegment {
     // Use Object.prototype.toString for cross-realm safety — instanceof
     // SharedArrayBuffer can fail when the value crosses V8 isolate boundaries
@@ -227,7 +274,7 @@ export class SharedTensorSegment {
       throw new RangeError(
         `maxBytes (${maxBytes}) inconsistent with SAB size (${sab.byteLength})`,
       );
-    return SharedTensorSegment._fromSAB(sab, /* initHeader */ false);
+    return SharedTensorSegment._fromSAB(sab, false, mode, ringCap);
   }
 
   // ── SAB accessor ───────────────────────────────────────────────────────────
@@ -251,6 +298,10 @@ export class SharedTensorSegment {
   }
 
   // ── Properties ────────────────────────────────────────────────────────────
+
+  get mode(): SegmentMode {
+    return this._mode;
+  }
 
   get byteCapacity(): number {
     return this._native.byteCapacity;
@@ -341,6 +392,28 @@ export class SharedTensorSegment {
    */
   async readCopyWait(): Promise<TensorResult | null> {
     return wrap(await this._native.readCopyWait());
+  }
+
+  // Ring-only API
+  push(
+    shape: number[],
+    dtype: DType,
+    buffer: ArrayBuffer | TypedArray,
+  ): boolean {
+    if (this._mode !== "ring")
+      throw new Error("push() is only available on ring segments");
+    try {
+      this._native.write(shape, dtype, buffer);
+      return true;
+    } catch (e: any) {
+      if (e?.message?.includes("ring buffer full")) return false;
+      throw e;
+    }
+  }
+  pop(): TensorResult | null {
+    if (this._mode !== "ring")
+      throw new Error("pop() is only available on ring segments");
+    return wrap(this._native.read());
   }
 
   // ── Pinning ───────────────────────────────────────────────────────────────
