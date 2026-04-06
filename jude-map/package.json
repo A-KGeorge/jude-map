@@ -2,6 +2,11 @@
   "name": "jude-map",
   "version": "0.3.0",
   "description": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/A-KGeorge/jude.git",
+    "directory": "jude-map"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
@@ -30,10 +35,6 @@
     "napi_versions": [
       8
     ]
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/A-KGeorge/jude.git"
   },
   "publishConfig": {
     "access": "public",

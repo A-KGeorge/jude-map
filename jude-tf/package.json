@@ -2,6 +2,11 @@
   "name": "jude-tf",
   "version": "1.0.0",
   "description": "TensorFlow C API bindings for Node.js — zero-copy inference via jude-map",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/A-KGeorge/jude.git",
+    "directory": "jude-tf"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -57,10 +62,6 @@
     "tsx": "^4.0.0",
     "typescript": "^5.0.0",
     "prebuildify": "^6.0.1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/A-KGeorge/jude.git"
   },
   "publishConfig": {
     "access": "public",
